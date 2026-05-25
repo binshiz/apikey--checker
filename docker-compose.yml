@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  apikey-checker:
+    build: .
+    container_name: apikey-checker
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai

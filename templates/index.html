@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>API Key Tier Detector</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Noto+Sans+SC:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <!-- Auth gate -->
+    <div id="auth-overlay" class="auth-overlay">
+      <div class="auth-box panel">
+        <h2>🔐 管理员验证</h2>
+        <p class="muted">请输入管理密钥以继续</p>
+        <input
+          id="auth-input"
+          type="password"
+          placeholder="管理密钥…"
+          autocomplete="off"
+        />
+        <div id="auth-error" class="auth-error hidden">密钥错误，请重试</div>
+        <button
+          id="auth-btn"
+          class="btn btn-primary"
+          style="width: 100%; margin-top: 12px"
+        >
+          验证
+        </button>
+      </div>
+    </div>
+
+    <header class="topbar">
+      <h1>🔑 API Key Tier Detector</h1>
+      <div class="brand-sub">
+        OpenAI · Claude · Gemini · 自动识别 / 批量探测 / 等级判定
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-tab="check">🔍 检测</button>
+        <button class="tab" data-tab="vault">
+          🗝️ 密钥库 <span id="vault-count-badge" class="count-pill">0</span>
+        </button>
+      </nav>
+    </header>
+
+    <main class="layout">
+      <!-- ════════════════ CHECK VIEW ════════════════ -->
+      <div id="view-check" class="view">
+        <!-- Import panel -->
+        <section class="panel">
+          <div class="panel-title">① 粘贴 Key（每行一个）</div>
+          <textarea
+            id="keys-input"
+            rows="8"
+            placeholder="sk-proj-...
+sk-ant-api03-...
+AIzaSy..."
+          ></textarea>
+
+          <div class="row">
+            <label
+              >并发数
+              <input id="concurrency" type="number" min="1" max="32" value="4"
+            /></label>
+            <label class="proxy-toggle">
+              <input id="use-proxy" type="checkbox" /> 使用 SOCKS5 代理池
+            </label>
+            <button id="btn-import" class="btn btn-primary">开始检测</button>
+            <button id="btn-refresh" class="btn">刷新</button>
+          </div>
+
+          <div id="job-status" class="job-status hidden">
+            <div class="job-bar"><div id="job-bar-fill"></div></div>
+            <div id="job-text">--</div>
+          </div>
+        </section>
+
+        <!-- Filter bar -->
+        <section class="panel">
+          <div class="filterbar">
+            <label
+              >厂商
+              <select id="f-provider">
+                <option value="">全部</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </label>
+            <label
+              >状态
+              <select id="f-status">
+                <option value="">全部</option>
+                <option value="valid">✅ 有效</option>
+                <option value="no_quota">⚠️ 无额度</option>
+                <option value="invalid">❌ 失效</option>
+                <option value="error">⚠ 错误</option>
+                <option value="pending">⏳ 待测</option>
+                <option value="checking">🔄 检测中</option>
+              </select>
+            </label>
+            <label
+              >等级
+              <select id="f-tier">
+                <option value="">全部</option>
+                <option>T1</option>
+                <option>T2</option>
+                <option>T3</option>
+                <option>Tier 1</option>
+                <option>Tier 2</option>
+                <option>Tier 3</option>
+                <option>Tier 4</option>
+                <option>Tier 5</option>
+                <option>Free</option>
+                <option>Unknown</option>
+              </select>
+            </label>
+
+            <span class="spacer"></span>
+
+            <button id="btn-select-all" class="btn">全选</button>
+            <button id="btn-copy" class="btn">复制选中</button>
+            <button id="btn-retest" class="btn btn-secondary">重新测试</button>
+            <button id="btn-delete" class="btn btn-danger">删除</button>
+          </div>
+          <div class="stats" id="stats">—</div>
+        </section>
+
+        <!-- Table -->
+        <section class="panel panel-table">
+          <table id="keys-table">
+            <thead>
+              <tr>
+                <th class="col-cb"><input id="cb-all" type="checkbox" /></th>
+                <th>厂商</th>
+                <th>Key</th>
+                <th>状态</th>
+                <th>等级</th>
+                <th>RPM</th>
+                <th>TPM</th>
+                <th>详情</th>
+                <th>检测时间</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="empty" class="empty">
+            暂无数据，先在上方粘贴 Key 开始检测。
+          </div>
+        </section>
+      </div>
+
+      <!-- ════════════════ VAULT VIEW ════════════════ -->
+      <div id="view-vault" class="view hidden">
+        <section class="panel">
+          <div class="filterbar">
+            <strong style="font-size: 15px">🗝️ 密钥库</strong>
+            <span class="muted">所有检测通过的有效 Key 会自动归档到这里</span>
+            <span class="spacer"></span>
+
+            <label
+              >厂商
+              <select id="v-provider">
+                <option value="">全部</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </label>
+            <label
+              >等级
+              <select id="v-tier">
+                <option value="">全部</option>
+                <option>T1</option>
+                <option>T2</option>
+                <option>T3</option>
+                <option>Tier 1</option>
+                <option>Tier 2</option>
+                <option>Tier 3</option>
+                <option>Tier 4</option>
+                <option>Tier 5</option>
+                <option>Free</option>
+                <option>Unknown</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="filterbar" style="margin-top: 12px">
+            <button id="v-btn-select-all" class="btn">全选</button>
+            <button id="v-btn-copy" class="btn">复制选中</button>
+            <button id="v-btn-retest" class="btn btn-secondary">
+              重新测试
+            </button>
+            <button id="v-btn-export" class="btn">导出 .txt</button>
+            <button id="v-btn-delete" class="btn btn-danger">从库中删除</button>
+            <span class="spacer"></span>
+            <span class="stats" id="v-stats">—</span>
+          </div>
+        </section>
+
+        <section class="panel panel-table">
+          <table id="vault-table">
+            <thead>
+              <tr>
+                <th class="col-cb"><input id="v-cb-all" type="checkbox" /></th>
+                <th>厂商</th>
+                <th>Key</th>
+                <th>等级</th>
+                <th>RPM</th>
+                <th>TPM</th>
+                <th>详情</th>
+                <th>次数</th>
+                <th>首次验证</th>
+                <th>最近验证</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="v-empty" class="empty">
+            密钥库为空。检测通过的 Key 会自动入库。
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

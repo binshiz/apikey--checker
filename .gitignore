@@ -1,0 +1,28 @@
+# Runtime data (API keys, proxy credentials, DB)
+data/*.db
+data/proxies.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# Pi agent cache
+.pi-lens/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session / secrets
+claude_cookies.json
+*.cookie
