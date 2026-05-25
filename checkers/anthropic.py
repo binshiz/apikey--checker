@@ -71,8 +71,8 @@ async def _single_call(client: httpx.AsyncClient, key: str, model: str) -> httpx
 
 
 async def _validate_and_probe_headers(client: httpx.AsyncClient, key: str) -> dict:
-    """Single call → check validity and pull rate-limit headers."""
-    out = {"valid": False, "error": None, "rpm": None, "in_tpm": None, "out_tpm": None, "model": PROBE_MODEL}
+    """Single call → check validity and pull rate-limit + org headers."""
+    out = {"valid": False, "error": None, "rpm": None, "in_tpm": None, "out_tpm": None, "model": PROBE_MODEL, "org_id": None}
     resp = await _single_call(client, key, PROBE_MODEL)
     if resp is None:
         # try fallback
@@ -108,6 +108,7 @@ async def _validate_and_probe_headers(client: httpx.AsyncClient, key: str) -> di
         out["rpm"] = rpm
         out["in_tpm"] = in_tpm
         out["out_tpm"] = out_tpm
+        out["org_id"] = resp.headers.get("anthropic-organization-id")
         if resp.status_code == 400:
             try:
                 body = resp.json()
@@ -183,6 +184,8 @@ async def check(key: str, proxy: str | None = None) -> dict:
         result["extra"]["header_rpm"] = info["rpm"]
         result["extra"]["header_input_tpm"] = info["in_tpm"]
         result["extra"]["header_output_tpm"] = info["out_tpm"]
+        if info.get("org_id"):
+            result["extra"]["org_id"] = info["org_id"]
 
         if info.get("error") == "no_quota":
             result["status"] = "no_quota"
