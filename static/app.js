@@ -41,6 +41,28 @@ async function api(method, path, body) {
 	return r.json();
 }
 
+async function apiResponse(method, path, body) {
+	const opts = {
+		method,
+		headers: {
+			"Content-Type": "application/json",
+			"X-Admin-Key": getAdminKey(),
+		},
+	};
+	if (body !== undefined) opts.body = JSON.stringify(body);
+	const r = await fetch(path, opts);
+	if (r.status === 401) {
+		sessionStorage.removeItem("admin_key");
+		showAuthOverlay();
+		throw new Error("unauthorized");
+	}
+	if (!r.ok) {
+		const t = await r.text().catch(() => "");
+		throw new Error(`${r.status}: ${t.slice(0, 200)}`);
+	}
+	return r;
+}
+
 function fmt(n) {
 	if (n === null || n === undefined) return "—";
 	return n.toLocaleString();
@@ -50,6 +72,13 @@ function fmtTime(t) {
 	if (!t) return "—";
 	const d = new Date(t * 1000);
 	return d.toLocaleString();
+}
+
+function fmtMoney(n) {
+	if (n === null || n === undefined || n === "") return "—";
+	const value = Number(n);
+	if (!Number.isFinite(value)) return "—";
+	return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 function providerBadge(p) {
@@ -69,6 +98,22 @@ function statusBadge(s) {
 	};
 	const text = map[s] || s || "—";
 	return `<span class="badge badge-status s-${s || "pending"}">${text}</span>`;
+}
+
+function stockStatusBadge(s) {
+	const map = {
+		pending_check: "待检测",
+		in_stock: "可售",
+		reserved: "已预留",
+		sold: "已售出",
+		returned: "已退回",
+		no_quota: "无额度",
+		invalid: "失效",
+		quarantined: "隔离",
+		archived: "归档",
+	};
+	const text = map[s] || s || "—";
+	return `<span class="badge badge-status inv-${s || "unknown"}">${text}</span>`;
 }
 
 function tierBadge(t) {
@@ -262,6 +307,32 @@ function detailChips(r) {
 	return `<div class="detail-chips">${chips.join("")}</div>`;
 }
 
+function inventorySupportedModelChips(r) {
+	const e = r.extra || {};
+	let chips = [];
+	if (r.provider === "openai") {
+		chips = openaiModelChips(e);
+		if (!chips.length) {
+			if (typeof e.has_gpt_5_5 !== "undefined")
+				chips.push(chip("gpt-5.5", e.has_gpt_5_5 ? "on" : "off"));
+			if (typeof e.has_gpt_image_2 !== "undefined")
+				chips.push(chip("gpt-image-2", e.has_gpt_image_2 ? "on" : "off"));
+			if (typeof e.has_sora_2 !== "undefined")
+				chips.push(chip("sora-2", e.has_sora_2 ? "on" : "off"));
+			if (e.models_count) chips.push(chip(`models ${e.models_count}`));
+		}
+	} else if (r.provider === "anthropic") {
+		chips = targetModelChips(e.supported_models);
+		if (!chips.length && e.models_error) chips.push(chip("models unavailable", "off", e.models_error));
+	} else if (r.provider === "gemini") {
+		if (e.probe_model) chips.push(chip(e.probe_model));
+		if (e.models_count) chips.push(chip(`models ${e.models_count}`));
+	}
+	return chips.length
+		? `<div class="detail-chips">${chips.join("")}</div>`
+		: `<span class="muted">—</span>`;
+}
+
 // ─── state ───────────────────────────────────────────────────────────
 const state = {
 	keys: [],
@@ -276,6 +347,12 @@ function getFilters() {
 		status: $("#f-status").value || null,
 		tier: $("#f-tier").value || null,
 	};
+}
+
+function resetCheckFilters() {
+	$("#f-provider").value = "";
+	$("#f-status").value = "";
+	$("#f-tier").value = "";
 }
 
 // ─── render ──────────────────────────────────────────────────────────
@@ -346,7 +423,9 @@ async function pollJob() {
 		await loadKeys();
 		// also refresh vault count badge (and vault list if currently viewing it)
 		refreshVaultBadge();
+		refreshInventoryBadge();
 		if (!$("#view-vault").classList.contains("hidden")) await loadVault();
+		if (!$("#view-inventory").classList.contains("hidden")) await loadInventory();
 
 		if (j.status === "done") {
 			clearInterval(state.jobPollTimer);
@@ -387,6 +466,9 @@ $("#btn-import").addEventListener("click", async () => {
 			.join(" / ");
 		toast(`已导入 ${r.imported} 个 (${bd})`);
 		$("#keys-input").value = "";
+		resetCheckFilters();
+		state.selected.clear();
+		await loadKeys();
 		startPolling(r.job_id);
 	} catch (e) {
 		toast("导入失败：" + e.message);
@@ -614,6 +696,68 @@ $("#v-btn-delete").addEventListener("click", async () => {
 	}
 });
 
+function openInboundModal() {
+	const ids = [...vaultState.selected];
+	if (!ids.length) return toast("请先选择要入库的 Key");
+	$("#inbound-supplier").value = "";
+	$("#inbound-cost").value = "";
+	$("#inbound-tags").value = "";
+	$("#inbound-note").value = "";
+	$("#inbound-error").textContent = "请填写供应商";
+	$("#inbound-error").classList.add("hidden");
+	$("#inbound-modal").classList.remove("hidden");
+	setTimeout(() => $("#inbound-supplier").focus(), 0);
+}
+
+function closeInboundModal() {
+	$("#inbound-modal").classList.add("hidden");
+}
+
+$("#v-btn-inbound").addEventListener("click", openInboundModal);
+$("#inbound-close").addEventListener("click", closeInboundModal);
+$("#inbound-cancel").addEventListener("click", closeInboundModal);
+$("#inbound-modal").addEventListener("click", (e) => {
+	if (e.target.id === "inbound-modal") closeInboundModal();
+});
+
+$("#inbound-submit").addEventListener("click", async () => {
+	const ids = [...vaultState.selected];
+	const supplierName = $("#inbound-supplier").value.trim();
+	if (!supplierName) {
+		$("#inbound-error").classList.remove("hidden");
+		$("#inbound-supplier").focus();
+		return;
+	}
+	const costRaw = $("#inbound-cost").value.trim();
+	const totalCost = costRaw ? Number(costRaw) : null;
+	if (costRaw && !Number.isFinite(totalCost)) {
+		$("#inbound-error").textContent = "总成本格式不正确";
+		$("#inbound-error").classList.remove("hidden");
+		return;
+	}
+	$("#inbound-submit").disabled = true;
+	try {
+		const r = await api("POST", "/api/vault/inbound", {
+			ids,
+			supplier_name: supplierName,
+			total_cost: totalCost,
+			tags: $("#inbound-tags").value.trim() || null,
+			note: $("#inbound-note").value.trim() || null,
+		});
+		toast(`已入库 ${r.inbounded} 个，跳过 ${r.skipped || 0} 个`);
+		vaultState.selected.clear();
+		closeInboundModal();
+		await loadVault();
+		await refreshInventoryBadge();
+		if (!$("#view-inventory").classList.contains("hidden")) await loadInventory();
+	} catch (e) {
+		$("#inbound-error").textContent = "入库失败：" + e.message;
+		$("#inbound-error").classList.remove("hidden");
+	} finally {
+		$("#inbound-submit").disabled = false;
+	}
+});
+
 $("#v-btn-export").addEventListener("click", () => {
 	const f = getVaultFilters();
 	const params = new URLSearchParams({ format: "txt", token: getAdminKey() });
@@ -625,6 +769,387 @@ $$("#v-provider, #v-tier").forEach((el) =>
 	el.addEventListener("change", loadVault),
 );
 
+// ─── inventory ──────────────────────────────────────────────────────
+const inventoryState = { keys: [], selected: new Set(), stats: {}, busy: false };
+
+function getInventoryFilters() {
+	return {
+		provider: $("#i-provider").value || null,
+		stock_status: $("#i-status").value || null,
+		tier: $("#i-tier").value || null,
+		supplier_id: $("#i-supplier").value || null,
+		batch_id: $("#i-batch").value || null,
+		risk_flag: $("#i-risk").value || null,
+	};
+}
+
+function setSelectOptions(selectEl, options, currentValue) {
+	selectEl.innerHTML = options
+		.map(({ value, label }) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
+		.join("");
+	if (options.some((opt) => String(opt.value) === String(currentValue))) {
+		selectEl.value = currentValue;
+	}
+}
+
+function renderInventoryFilterOptions(stats = {}) {
+	const suppliers = stats.suppliers || [];
+	const batches = stats.batches || [];
+	const riskFlags = stats.risk_flags || [];
+	const supplierValue = $("#i-supplier").value;
+	const batchValue = $("#i-batch").value;
+	const riskValue = $("#i-risk").value;
+
+	setSelectOptions(
+		$("#i-supplier"),
+		[
+			{ value: "", label: "全部" },
+			...suppliers.map((s) => ({
+				value: s.id,
+				label: `${s.name} (${s.count})`,
+			})),
+		],
+		supplierValue,
+	);
+	setSelectOptions(
+		$("#i-batch"),
+		[
+			{ value: "", label: "全部" },
+			...batches.map((b) => ({
+				value: b.id,
+				label: `${b.name} (${b.count})`,
+			})),
+		],
+		batchValue,
+	);
+	setSelectOptions(
+		$("#i-risk"),
+		[
+			{ value: "", label: "全部" },
+			{ value: "__empty__", label: "无标记" },
+			...riskFlags.map((r) => ({
+				value: r.risk_flag,
+				label: `${r.risk_flag} (${r.count})`,
+			})),
+		],
+		riskValue,
+	);
+}
+
+function renderInventoryStats(stats = {}) {
+	inventoryState.stats = stats;
+	renderInventoryFilterOptions(stats);
+	const byStatus = stats.by_status || {};
+	const items = [
+		["总库存", stats.total ?? 0],
+		["可售", byStatus.in_stock || 0],
+		["预留", byStatus.reserved || 0],
+		["无额度", byStatus.no_quota || 0],
+		["失效", byStatus.invalid || 0],
+		["隔离", byStatus.quarantined || 0],
+		["归档", byStatus.archived || 0],
+	];
+	$("#inventory-stats").innerHTML = items
+		.map(([label, value]) => `<span class="metric"><b>${fmt(value)}</b>${escapeHtml(label)}</span>`)
+		.join("");
+	$("#inventory-count-badge").textContent = stats.total ?? 0;
+}
+
+function updateInventorySelectionStats() {
+	const count = inventoryState.selected.size;
+	$("#i-selection-stats").textContent = count ? `已选择 ${count} 个` : "未选择";
+	const allVisible = inventoryState.keys.length > 0 && inventoryState.keys.every((r) => inventoryState.selected.has(r.id));
+	$("#i-cb-all").checked = allVisible;
+}
+
+function selectedInventoryObjs() {
+	return inventoryState.keys.filter((r) => inventoryState.selected.has(r.id));
+}
+
+function renderInventory() {
+	const tbody = $("#inventory-table tbody");
+	const empty = $("#i-empty");
+	tbody.innerHTML = "";
+	if (!inventoryState.keys.length) empty.classList.remove("hidden");
+	else empty.classList.add("hidden");
+
+	for (const r of inventoryState.keys) {
+		const tr = document.createElement("tr");
+		tr.dataset.id = r.id;
+		const costText = r.unit_cost !== null && r.unit_cost !== undefined
+			? fmtMoney(r.unit_cost)
+			: fmtMoney(r.batch_total_cost);
+		tr.innerHTML = `
+      <td class="col-cb"><input type="checkbox" class="i-cb-row" ${inventoryState.selected.has(r.id) ? "checked" : ""}></td>
+      <td>${providerBadge(r.provider)}</td>
+      <td class="key-cell" title="完整 Key 需通过选中复制/导出">${escapeHtml(r.api_key_short)}</td>
+      <td>${stockStatusBadge(r.stock_status)}</td>
+      <td>${tierBadge(r.tier)}</td>
+      <td>${fmt(r.rpm)}</td>
+      <td>${fmt(r.tpm)}</td>
+      <td>${inventorySupportedModelChips(r)}</td>
+      <td>${escapeHtml(r.batch_name || "—")}</td>
+      <td>${costText}</td>
+      <td>${escapeHtml(r.supplier_name || "—")}</td>
+      <td><input class="table-input i-meta" data-field="tags" value="${escapeHtml(r.tags || "")}" placeholder="${escapeHtml(r.batch_tags || "标签")}"></td>
+      <td>${r.latest_check_status ? `${statusBadge(r.latest_check_status)} ${fmtTime(r.latest_check_at)}` : fmtTime(r.last_checked_at)}</td>
+      <td><input class="table-input i-meta" data-field="note" value="${escapeHtml(r.note || "")}" placeholder="备注"></td>
+      <td><button class="btn btn-small i-detail" type="button">详情</button></td>
+    `;
+		tbody.appendChild(tr);
+	}
+	updateInventorySelectionStats();
+}
+
+async function loadInventory() {
+	const f = getInventoryFilters();
+	const params = new URLSearchParams();
+	for (const k in f) if (f[k]) params.set(k, f[k]);
+	const data = await api("GET", `/api/inventory?${params.toString()}`);
+	inventoryState.keys = data.keys || [];
+	const visibleIds = new Set(inventoryState.keys.map((r) => r.id));
+	inventoryState.selected.forEach((id) => {
+		if (!visibleIds.has(id)) inventoryState.selected.delete(id);
+	});
+	renderInventoryStats(data.stats || {});
+	renderInventory();
+}
+
+function setInventoryBusy(busy) {
+	inventoryState.busy = busy;
+	$$(".inventory-actions button").forEach((btn) => {
+		btn.disabled = busy;
+	});
+}
+
+async function runInventoryBulkAction(action, confirmText) {
+	const ids = [...inventoryState.selected];
+	if (!ids.length) return toast("请先选择库存");
+	if (confirmText && !confirm(confirmText(ids.length))) return;
+	setInventoryBusy(true);
+	try {
+		const r = await api("POST", "/api/inventory/status", { ids, action });
+		toast(`已更新 ${r.updated} 个，跳过 ${r.skipped || 0} 个`);
+		inventoryState.selected.clear();
+		await loadInventory();
+	} catch (e) {
+		toast("操作失败：" + e.message);
+	} finally {
+		setInventoryBusy(false);
+	}
+}
+
+async function recheckInventorySelected() {
+	const ids = [...inventoryState.selected];
+	if (!ids.length) return toast("请先选择库存");
+	if (!confirm(`确认复检 ${ids.length} 个库存 Key？归档项会跳过。`)) return;
+	const concurrency = parseInt($("#concurrency").value, 10) || 4;
+	const useProxy = $("#use-proxy").checked;
+	setInventoryBusy(true);
+	try {
+		const r = await api("POST", "/api/inventory/recheck", {
+			ids,
+			concurrency,
+			use_proxy: useProxy,
+		});
+		toast(`已加入复检 ${r.queued} 个，跳过 ${r.skipped || 0} 个`);
+		inventoryState.selected.clear();
+		await loadInventory();
+		if (r.job_id) startPolling(r.job_id);
+	} catch (e) {
+		toast("复检失败：" + e.message);
+	} finally {
+		setInventoryBusy(false);
+	}
+}
+
+async function exportInventorySelected(format = "txt") {
+	const ids = [...inventoryState.selected];
+	if (!ids.length) return toast("请先选择库存");
+	if (!confirm(`确认导出 ${ids.length} 个完整 Key？`)) return null;
+	const response = await apiResponse("POST", "/api/inventory/export", { ids, format });
+	return format === "json" ? response.json() : response.text();
+}
+
+async function copyInventorySelected() {
+	try {
+		const text = await exportInventorySelected("txt");
+		if (!text) return;
+		await navigator.clipboard.writeText(text);
+		toast(`已复制 ${text.split("\n").filter(Boolean).length} 个完整 Key`);
+	} catch (e) {
+		toast("复制失败：" + e.message);
+	}
+}
+
+async function downloadInventorySelected() {
+	try {
+		const text = await exportInventorySelected("txt");
+		if (!text) return;
+		const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = `inventory-keys-${Date.now()}.txt`;
+		document.body.appendChild(a);
+		a.click();
+		a.remove();
+		URL.revokeObjectURL(url);
+		toast("导出已开始");
+	} catch (e) {
+		toast("导出失败：" + e.message);
+	}
+}
+
+async function saveInventoryMeta(tr) {
+	const id = parseInt(tr.dataset.id, 10);
+	const payload = {};
+	$$(".i-meta", tr).forEach((input) => {
+		payload[input.dataset.field] = input.value.trim() || null;
+	});
+	const row = inventoryState.keys.find((r) => r.id === id);
+	payload.risk_flag = row?.risk_flag || null;
+	try {
+		await api("POST", `/api/inventory/meta/${id}`, payload);
+		if (row) Object.assign(row, payload);
+		toast("库存信息已保存");
+		await refreshInventoryBadge();
+	} catch (e) {
+		toast("保存失败：" + e.message);
+	}
+}
+
+function closeInventoryDetail() {
+	$("#inventory-detail-modal").classList.add("hidden");
+}
+
+function renderInventoryDetail(data) {
+	const item = data.item || {};
+	const checks = data.check_runs || [];
+	const movements = data.movements || [];
+	const checkRows = checks.length
+		? checks.map((r) => `
+        <tr>
+          <td>${fmtTime(r.checked_at)}</td>
+          <td>${statusBadge(r.status)}</td>
+          <td>${tierBadge(r.tier)}</td>
+          <td>${fmt(r.rpm)}</td>
+          <td>${fmt(r.tpm)}</td>
+          <td>${escapeHtml(r.error || r.source || "—")}</td>
+        </tr>
+      `).join("")
+		: `<tr><td colspan="6">暂无检测历史</td></tr>`;
+	const movementRows = movements.length
+		? movements.map((m) => `
+        <tr>
+          <td>${fmtTime(m.created_at)}</td>
+          <td>${escapeHtml(m.movement_type)}</td>
+          <td>${stockStatusBadge(m.from_status)}</td>
+          <td>${stockStatusBadge(m.to_status)}</td>
+          <td>${escapeHtml(m.reason || "—")}</td>
+        </tr>
+      `).join("")
+		: `<tr><td colspan="5">暂无库存流水</td></tr>`;
+	$("#inventory-detail-body").innerHTML = `
+    <div class="detail-grid">
+      <div><b>Key</b><span>${escapeHtml(item.api_key_short || "—")}</span></div>
+      <div><b>厂商</b><span>${providerBadge(item.provider)}</span></div>
+      <div><b>库存状态</b><span>${stockStatusBadge(item.stock_status)}</span></div>
+      <div><b>等级</b><span>${tierBadge(item.tier)}</span></div>
+      <div><b>供应商</b><span>${escapeHtml(item.supplier_name || "—")}</span></div>
+      <div><b>批次</b><span>${escapeHtml(item.batch_name || "—")}</span></div>
+      <div><b>成本</b><span>${fmtMoney(item.unit_cost)}</span></div>
+      <div><b>风险</b><span>${escapeHtml(item.risk_flag || "—")}</span></div>
+    </div>
+    <h3>检测历史</h3>
+    <div class="detail-table-wrap">
+      <table class="mini-table">
+        <thead><tr><th>时间</th><th>结果</th><th>等级</th><th>RPM</th><th>TPM</th><th>说明</th></tr></thead>
+        <tbody>${checkRows}</tbody>
+      </table>
+    </div>
+    <h3>库存流水</h3>
+    <div class="detail-table-wrap">
+      <table class="mini-table">
+        <thead><tr><th>时间</th><th>动作</th><th>从</th><th>到</th><th>原因</th></tr></thead>
+        <tbody>${movementRows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function openInventoryDetail(id) {
+	try {
+		$("#inventory-detail-body").innerHTML = `<div class="empty">加载中…</div>`;
+		$("#inventory-detail-modal").classList.remove("hidden");
+		const data = await api("GET", `/api/inventory/${id}`);
+		renderInventoryDetail(data);
+	} catch (e) {
+		$("#inventory-detail-body").innerHTML = `<div class="auth-error">加载失败：${escapeHtml(e.message)}</div>`;
+	}
+}
+
+$$("#i-provider, #i-status, #i-tier, #i-supplier, #i-batch, #i-risk").forEach((el) =>
+	el.addEventListener("change", loadInventory),
+);
+
+$("#i-cb-all").addEventListener("change", (e) => {
+	const checked = e.target.checked;
+	inventoryState.keys.forEach((r) =>
+		checked ? inventoryState.selected.add(r.id) : inventoryState.selected.delete(r.id),
+	);
+	renderInventory();
+});
+
+$("#i-btn-select-all").addEventListener("click", () => {
+	if (inventoryState.keys.length && inventoryState.keys.every((r) => inventoryState.selected.has(r.id))) {
+		inventoryState.selected.clear();
+	} else {
+		inventoryState.keys.forEach((r) => inventoryState.selected.add(r.id));
+	}
+	renderInventory();
+});
+
+$("#inventory-table tbody").addEventListener("click", (e) => {
+	const tr = e.target.closest("tr");
+	if (!tr) return;
+	const id = parseInt(tr.dataset.id, 10);
+	if (e.target.classList.contains("i-cb-row")) {
+		if (e.target.checked) inventoryState.selected.add(id);
+		else inventoryState.selected.delete(id);
+		updateInventorySelectionStats();
+	} else if (e.target.classList.contains("i-detail")) {
+		openInventoryDetail(id);
+	}
+});
+
+$("#inventory-table tbody").addEventListener("change", (e) => {
+	if (e.target.classList.contains("i-meta")) {
+		const tr = e.target.closest("tr");
+		if (tr) saveInventoryMeta(tr);
+	}
+});
+
+$("#i-btn-recheck").addEventListener("click", recheckInventorySelected);
+$("#i-btn-reserve").addEventListener("click", () =>
+	runInventoryBulkAction("reserve", (n) => `确认预留 ${n} 个可售库存？`),
+);
+$("#i-btn-restore").addEventListener("click", () =>
+	runInventoryBulkAction("restore_to_stock", (n) => `确认把 ${n} 个最近有效的库存恢复为可售？`),
+);
+$("#i-btn-quarantine").addEventListener("click", () =>
+	runInventoryBulkAction("quarantine", (n) => `确认隔离 ${n} 个库存？`),
+);
+$("#i-btn-archive").addEventListener("click", () =>
+	runInventoryBulkAction("archive", (n) => `确认归档 ${n} 个库存？归档后默认不会复检。`),
+);
+$("#i-btn-copy").addEventListener("click", copyInventorySelected);
+$("#i-btn-export").addEventListener("click", downloadInventorySelected);
+$("#inventory-detail-close").addEventListener("click", closeInventoryDetail);
+$("#inventory-detail-modal").addEventListener("click", (e) => {
+	if (e.target.id === "inventory-detail-modal") closeInventoryDetail();
+});
+
 // ─── tab switching ───────────────────────────────────────────────────
 function switchTab(name) {
 	$$(".tab").forEach((t) =>
@@ -632,7 +1157,9 @@ function switchTab(name) {
 	);
 	$("#view-check").classList.toggle("hidden", name !== "check");
 	$("#view-vault").classList.toggle("hidden", name !== "vault");
+	$("#view-inventory").classList.toggle("hidden", name !== "inventory");
 	if (name === "vault") loadVault();
+	if (name === "inventory") loadInventory();
 }
 $$(".tab").forEach((t) =>
 	t.addEventListener("click", () => switchTab(t.dataset.tab)),
@@ -642,6 +1169,13 @@ async function refreshVaultBadge() {
 	try {
 		const r = await api("GET", "/api/vault?");
 		$("#vault-count-badge").textContent = r.stats?.total ?? 0;
+	} catch (e) {}
+}
+
+async function refreshInventoryBadge() {
+	try {
+		const r = await api("GET", "/api/inventory?");
+		$("#inventory-count-badge").textContent = r.stats?.total ?? 0;
 	} catch (e) {}
 }
 
@@ -687,6 +1221,7 @@ $("#auth-input").addEventListener("keydown", (e) => {
 async function bootApp() {
 	await loadKeys();
 	await refreshVaultBadge();
+	await refreshInventoryBadge();
 	try {
 		const r = await api("GET", "/api/jobs/running");
 		if (r.jobs && r.jobs.length) startPolling(r.jobs[0].id);

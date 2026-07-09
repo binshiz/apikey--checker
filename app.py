@@ -150,6 +150,31 @@ class IdsPayload(BaseModel):
     use_proxy: bool = False
 
 
+class VaultInboundPayload(BaseModel):
+    ids: list[int]
+    supplier_name: str
+    total_cost: float | None = None
+    tags: str | None = None
+    note: str | None = None
+
+
+class InventoryStatusPayload(BaseModel):
+    ids: list[int]
+    action: str
+    reason: str | None = None
+
+
+class InventoryMetaPayload(BaseModel):
+    note: str | None = None
+    tags: str | None = None
+    risk_flag: str | None = None
+
+
+class InventoryExportPayload(BaseModel):
+    ids: list[int]
+    format: str = "txt"
+
+
 # ────────────────────────────────────────────────────────────────────
 # Routes
 # ────────────────────────────────────────────────────────────────────
@@ -294,6 +319,24 @@ async def vault_note(vault_id: int, payload: NotePayload):
     return {"ok": True}
 
 
+@app.post("/api/vault/inbound", dependencies=[Depends(require_auth)])
+async def vault_inbound(payload: VaultInboundPayload):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    if not payload.supplier_name.strip():
+        raise HTTPException(400, "supplier_name required")
+    try:
+        return db.inbound_from_vault(
+            payload.ids,
+            payload.supplier_name,
+            total_cost=payload.total_cost,
+            tags=payload.tags,
+            note=payload.note,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/vault/export")
 async def vault_export(format: str = "txt", provider: str | None = None, tier: str | None = None, token: str | None = None, request: Request = None):
     header_key = request.headers.get("X-Admin-Key", "") if request else ""
@@ -302,6 +345,120 @@ async def vault_export(format: str = "txt", provider: str | None = None, tier: s
     rows = db.list_vault(provider=provider, tier=tier)
     if format == "json":
         return JSONResponse(rows)
+    body = "\n".join(r["api_key"] for r in rows)
+    return PlainTextResponse(body)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Inventory — formally inbounded keys
+# ────────────────────────────────────────────────────────────────────
+
+def _parse_json_field(value: str | None) -> Any:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def _safe_inventory_row(row: dict, *, include_full_key: bool = False) -> dict:
+    row["extra"] = _parse_json_field(row.get("extra"))
+    row["api_key_short"] = short_key(row.get("api_key") or "")
+    if not include_full_key:
+        row.pop("api_key", None)
+    return row
+
+
+def _safe_check_run(row: dict) -> dict:
+    row["extra"] = _parse_json_field(row.get("extra"))
+    row.pop("proxy", None)
+    return row
+
+
+def _safe_movement(row: dict) -> dict:
+    row["metadata"] = _parse_json_field(row.get("metadata"))
+    return row
+
+
+@app.get("/api/inventory", dependencies=[Depends(require_auth)])
+async def inventory_list(
+    provider: str | None = None,
+    stock_status: str | None = None,
+    tier: str | None = None,
+    supplier_id: int | None = None,
+    batch_id: int | None = None,
+    risk_flag: str | None = None,
+):
+    rows = db.list_inventory(
+        provider=provider,
+        stock_status=stock_status,
+        tier=tier,
+        supplier_id=supplier_id,
+        batch_id=batch_id,
+        risk_flag=risk_flag,
+    )
+    for r in rows:
+        _safe_inventory_row(r)
+    return {"keys": rows, "count": len(rows), "stats": db.inventory_stats()}
+
+
+@app.get("/api/inventory/{inventory_id}", dependencies=[Depends(require_auth)])
+async def inventory_detail(inventory_id: int):
+    detail = db.get_inventory_detail(inventory_id)
+    if not detail:
+        raise HTTPException(404, "inventory item not found")
+    item = _safe_inventory_row(detail["item"])
+    check_runs = [_safe_check_run(r) for r in detail["check_runs"]]
+    movements = [_safe_movement(r) for r in detail["movements"]]
+    return {"item": item, "check_runs": check_runs, "movements": movements}
+
+
+@app.post("/api/inventory/recheck", dependencies=[Depends(require_auth)])
+async def inventory_recheck(payload: IdsPayload):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    prepared = db.prepare_inventory_recheck(payload.ids)
+    key_ids = prepared["key_ids"]
+    if not key_ids:
+        return {"job_id": None, "queued": 0, "skipped": prepared["skipped"]}
+    job_id = db.create_job(len(key_ids), payload.concurrency)
+    asyncio.create_task(run_job(key_ids, max(1, payload.concurrency), job_id, use_proxy=payload.use_proxy))
+    return {"job_id": job_id, "queued": len(key_ids), "skipped": prepared["skipped"]}
+
+
+@app.post("/api/inventory/status", dependencies=[Depends(require_auth)])
+async def inventory_status(payload: InventoryStatusPayload):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    try:
+        return db.update_inventory_status(payload.ids, payload.action, payload.reason)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/inventory/meta/{inventory_id}", dependencies=[Depends(require_auth)])
+async def inventory_meta(inventory_id: int, payload: InventoryMetaPayload):
+    ok = db.update_inventory_meta(
+        inventory_id,
+        note=payload.note,
+        tags=payload.tags,
+        risk_flag=payload.risk_flag,
+    )
+    if not ok:
+        raise HTTPException(404, "inventory item not found")
+    return {"ok": True}
+
+
+@app.post("/api/inventory/export", dependencies=[Depends(require_auth)])
+async def inventory_export(payload: InventoryExportPayload):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    rows = db.export_inventory_entries(payload.ids)
+    if payload.format == "json":
+        return JSONResponse([_safe_inventory_row(dict(r), include_full_key=True) for r in rows])
+    if payload.format != "txt":
+        raise HTTPException(400, "unsupported format")
     body = "\n".join(r["api_key"] for r in rows)
     return PlainTextResponse(body)
 

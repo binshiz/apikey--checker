@@ -2,6 +2,10 @@
 
 A web tool that batch-checks OpenAI / Anthropic / Gemini API keys, auto-detects the provider from key format, probes for usability and tier, and stores results in SQLite.
 
+## Direction
+
+This project is evolving from a detector into a lightweight API key inventory system. The current checker flow acts as the quality-control layer: imported keys are checked, valid keys are vaulted, and the database now keeps inventory, stock movement, supplier/batch, and check-run foundations for future inbound, outbound, sales, and reporting workflows.
+
 ## Features
 
 - **Auto-detect provider** from key string (`sk-proj-…`, `sk-ant-…`, `AIza…`).

@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Noto+Sans+SC:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/style.css?v=20260708-anthropic-models-2" />
+    <link rel="stylesheet" href="/static/style.css?v=20260710-inventory-ops" />
   </head>
   <body>
     <!-- Auth gate -->
@@ -45,8 +45,54 @@
         <button class="tab" data-tab="vault">
           🗝️ 密钥库 <span id="vault-count-badge" class="count-pill">0</span>
         </button>
+        <button class="tab" data-tab="inventory">
+          库存 <span id="inventory-count-badge" class="count-pill">0</span>
+        </button>
       </nav>
     </header>
+
+    <div id="inbound-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="inbound-title">
+      <div class="modal-box panel">
+        <div class="modal-head">
+          <h2 id="inbound-title">选中入库</h2>
+          <button id="inbound-close" class="btn btn-icon" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="form-grid inbound-form">
+          <label>
+            供应商 <span class="required">*</span>
+            <input id="inbound-supplier" type="text" autocomplete="off" placeholder="供应商名称" />
+          </label>
+          <label>
+            总成本
+            <input id="inbound-cost" type="number" min="0" step="0.01" placeholder="可空" />
+          </label>
+          <label>
+            标签
+            <input id="inbound-tags" type="text" autocomplete="off" placeholder="可空，用逗号分隔" />
+          </label>
+          <label class="form-wide">
+            备注
+            <input id="inbound-note" type="text" autocomplete="off" placeholder="可空" />
+          </label>
+        </div>
+        <div class="muted form-hint">入库时间和批次由系统自动生成。</div>
+        <div id="inbound-error" class="auth-error hidden">请填写供应商</div>
+        <div class="modal-actions">
+          <button id="inbound-cancel" class="btn" type="button">取消</button>
+          <button id="inbound-submit" class="btn btn-primary" type="button">确认入库</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="inventory-detail-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="inventory-detail-title">
+      <div class="modal-box panel inventory-detail-box">
+        <div class="modal-head">
+          <h2 id="inventory-detail-title">库存详情</h2>
+          <button id="inventory-detail-close" class="btn btn-icon" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="inventory-detail-body" class="inventory-detail-body"></div>
+      </div>
+    </div>
 
     <main class="layout">
       <!-- ════════════════ CHECK VIEW ════════════════ -->
@@ -196,6 +242,7 @@ AIzaSy..."
             <button id="v-btn-retest" class="btn btn-secondary">
               重新测试
             </button>
+            <button id="v-btn-inbound" class="btn btn-primary">选中入库</button>
             <button id="v-btn-export" class="btn">导出 .txt</button>
             <button id="v-btn-delete" class="btn btn-danger">从库中删除</button>
             <span class="spacer"></span>
@@ -227,8 +274,118 @@ AIzaSy..."
           </div>
         </section>
       </div>
+
+      <!-- ════════════════ INVENTORY VIEW ════════════════ -->
+      <div id="view-inventory" class="view hidden">
+        <section class="panel">
+          <div class="filterbar">
+            <strong style="font-size: 15px">库存</strong>
+            <span class="muted">从密钥库正式入库后的 Key 会显示在这里</span>
+            <span class="spacer"></span>
+
+            <label
+              >厂商
+              <select id="i-provider">
+                <option value="">全部</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </label>
+            <label
+              >状态
+              <select id="i-status">
+                <option value="">全部</option>
+                <option value="in_stock">可售</option>
+                <option value="reserved">已预留</option>
+                <option value="no_quota">无额度</option>
+                <option value="invalid">失效</option>
+                <option value="quarantined">隔离</option>
+                <option value="archived">归档</option>
+              </select>
+            </label>
+            <label
+              >等级
+              <select id="i-tier">
+                <option value="">全部</option>
+                <option>T1</option>
+                <option>T2</option>
+                <option>T3</option>
+                <option>Tier 1</option>
+                <option>Tier 2</option>
+                <option>Tier 3</option>
+                <option>Tier 4</option>
+                <option>Tier 5</option>
+                <option>Free</option>
+                <option>Unknown</option>
+              </select>
+            </label>
+            <label
+              >供应商
+              <select id="i-supplier">
+                <option value="">全部</option>
+              </select>
+            </label>
+            <label
+              >批次
+              <select id="i-batch">
+                <option value="">全部</option>
+              </select>
+            </label>
+            <label
+              >风险
+              <select id="i-risk">
+                <option value="">全部</option>
+                <option value="__empty__">无标记</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="filterbar inventory-actions">
+            <button id="i-btn-select-all" class="btn" type="button">全选</button>
+            <button id="i-btn-recheck" class="btn btn-secondary" type="button">批量复检</button>
+            <button id="i-btn-reserve" class="btn" type="button">预留</button>
+            <button id="i-btn-restore" class="btn btn-primary" type="button">恢复可售</button>
+            <button id="i-btn-quarantine" class="btn" type="button">隔离</button>
+            <button id="i-btn-archive" class="btn btn-danger" type="button">归档</button>
+            <button id="i-btn-copy" class="btn" type="button">复制完整 Key</button>
+            <button id="i-btn-export" class="btn" type="button">导出选中</button>
+            <span class="spacer"></span>
+            <span class="stats" id="i-selection-stats">未选择</span>
+          </div>
+          <div id="inventory-stats" class="metric-row"></div>
+        </section>
+
+        <section class="panel panel-table">
+          <table id="inventory-table">
+            <thead>
+              <tr>
+                <th class="col-cb"><input id="i-cb-all" type="checkbox" /></th>
+                <th>厂商</th>
+                <th>Key</th>
+                <th>库存状态</th>
+                <th>等级</th>
+                <th>RPM</th>
+                <th>TPM</th>
+                <th>支持模型</th>
+                <th>批次</th>
+                <th>成本</th>
+                <th>供应商</th>
+                <th>标签</th>
+                <th>最近检测</th>
+                <th>备注</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="i-empty" class="empty">
+            库存为空。请先在密钥库中选中有效 Key 入库。
+          </div>
+        </section>
+      </div>
     </main>
 
-    <script src="/static/app.js?v=20260708-anthropic-models-2"></script>
+    <script src="/static/app.js?v=20260710-check-result-top"></script>
   </body>
 </html>
