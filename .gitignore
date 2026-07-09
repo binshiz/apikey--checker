@@ -1,6 +1,8 @@
 # Runtime data (API keys, proxy credentials, DB)
 data/*.db
 data/proxies.txt
+data/working_proxies.txt
+data/dead_proxies.txt
 
 # Python
 __pycache__/

@@ -4,5 +4,10 @@ __pycache__
 venv
 *.db
 data/*.db
+data/proxies.txt
+data/working_proxies.txt
+data/dead_proxies.txt
+.env
+.env.local
 .git
 .DS_Store

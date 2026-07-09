@@ -1,6 +1,6 @@
-"""OpenAI key checker — tier via TPM/RPM headers + burst RPM fallback +
-gpt-5.5 / gpt-image-2 / sora-2 access probe."""
+"""OpenAI key checker — tier via TPM/RPM headers + dynamic model discovery."""
 import asyncio
+import re
 import time
 import httpx
 
@@ -68,10 +68,23 @@ RL_HEADERS_TPM = [
     "x-ratelimit-limit-tokens-per-minute",
 ]
 
-# Candidate model IDs to probe access for image/video/chat.
-IMAGE_PROBE_IDS = ["gpt-image-2", "gpt-image-1"]
-VIDEO_PROBE_IDS = ["sora-2", "sora-2-pro", "sora-1.0", "sora"]
-CHAT_PROBE_IDS = ["gpt-5.5", "gpt-5.5-mini", "gpt-5", "gpt-5-mini"]
+MODEL_GROUP_ORDER = [
+    "text",
+    "reasoning",
+    "image",
+    "video",
+    "audio",
+    "embedding",
+    "moderation",
+    "other",
+]
+
+DISPLAY_MODEL_TARGETS = [
+    {"label": "gpt-5.6", "prefixes": ("gpt-5.6",)},
+    {"label": "gpt-5.5", "prefixes": ("gpt-5.5", "gpt5.5")},
+    {"label": "gpt-image-2", "prefixes": ("gpt-image-2",)},
+    {"label": "sora-2", "prefixes": ("sora-2",)},
+]
 
 
 def _parse_int(v):
@@ -116,6 +129,137 @@ def _guess_tier_from_rpm(rpm: int | None) -> str | None:
     if rpm <= 10000:
         return "Tier 4"
     return "Tier 5"
+
+
+def _version_parts(model_id: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", model_id))
+
+
+def _variant_rank(model_id: str) -> int:
+    m = model_id.lower()
+    rank = 0
+    if "pro" in m:
+        rank += 30
+    if "turbo" in m:
+        rank += 20
+    if "mini" in m:
+        rank -= 20
+    if "nano" in m:
+        rank -= 30
+    if "preview" in m:
+        rank -= 5
+    return rank
+
+
+def _classify_model(model_id: str) -> str:
+    m = model_id.lower()
+    if "moderation" in m:
+        return "moderation"
+    if "embedding" in m:
+        return "embedding"
+    if m.startswith("sora") or "video" in m:
+        return "video"
+    if m.startswith(("gpt-image", "dall-e")) or "image" in m:
+        return "image"
+    if (
+        "audio" in m
+        or "realtime" in m
+        or m.startswith(("tts", "whisper", "transcribe"))
+    ):
+        return "audio"
+    if re.match(r"^o\d", m) or m.startswith("o-") or "reasoning" in m:
+        return "reasoning"
+    if m.startswith(("gpt-", "chatgpt-", "ft:gpt-")):
+        return "text"
+    return "other"
+
+
+def _model_family(model_id: str, group: str | None = None) -> str:
+    m = model_id.lower()
+    if m.startswith("gpt-image"):
+        return "gpt-image"
+    if m.startswith("sora"):
+        return "sora"
+    if group in {"audio", "embedding", "moderation"}:
+        return group
+    if re.match(r"^o\d", m) or m.startswith("o-"):
+        return "o"
+    if m.startswith(("gpt-", "chatgpt-", "ft:gpt-")):
+        return "gpt"
+    return re.split(r"[-:]", m, maxsplit=1)[0] or "other"
+
+
+def _model_sort_key(model_id: str) -> tuple:
+    group = _classify_model(model_id)
+    group_rank = MODEL_GROUP_ORDER.index(group) if group in MODEL_GROUP_ORDER else len(MODEL_GROUP_ORDER)
+    version = _version_parts(model_id)
+    # Negative numeric pieces make Python's ascending sort put larger versions first.
+    version_rank = tuple(-part for part in version) or (0,)
+    return (group_rank, version_rank, -_variant_rank(model_id), model_id)
+
+
+def _sorted_models(model_ids: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for mid in model_ids:
+        mid = str(mid).strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return sorted(out, key=_model_sort_key)
+
+
+def _target_matches(model_id: str, prefix: str) -> bool:
+    mid = model_id.lower()
+    p = prefix.lower()
+    return mid == p or mid.startswith(f"{p}-") or mid.startswith(f"{p}.")
+
+
+def _find_target_model(sorted_ids: list[str], prefixes: tuple[str, ...]) -> str | None:
+    for prefix in prefixes:
+        for mid in sorted_ids:
+            if mid.lower() == prefix.lower():
+                return mid
+    for prefix in prefixes:
+        for mid in sorted_ids:
+            if _target_matches(mid, prefix):
+                return mid
+    return None
+
+
+def build_supported_models(model_ids: list[str]) -> dict:
+    """Build UI-friendly model capability summary from /v1/models IDs."""
+    sorted_ids = _sorted_models(model_ids)
+    groups = {group: [] for group in MODEL_GROUP_ORDER}
+    latest_by_family = {}
+
+    for mid in sorted_ids:
+        group = _classify_model(mid)
+        groups.setdefault(group, []).append(mid)
+        family = _model_family(mid, group)
+        latest_by_family.setdefault(family, mid)
+
+    display_targets = []
+    featured = []
+    for target in DISPLAY_MODEL_TARGETS:
+        mid = _find_target_model(sorted_ids, target["prefixes"])
+        if mid and mid not in featured:
+            featured.append(mid)
+        display_targets.append({
+            "label": target["label"],
+            "model": mid,
+            "supported": bool(mid),
+            "group": _classify_model(mid) if mid else None,
+        })
+
+    return {
+        "groups": groups,
+        "featured": featured,
+        "display_targets": display_targets,
+        "latest_by_family": latest_by_family,
+        "all_count": len(sorted_ids),
+    }
 
 
 async def _detect_tier(client: httpx.AsyncClient, key: str) -> tuple[str | None, int | None, int | None]:
@@ -265,30 +409,6 @@ async def _burst_rpm_probe(client: httpx.AsyncClient, key: str, cap: int = 60) -
     }
 
 
-async def _probe_model_access(client: httpx.AsyncClient, key: str, candidates: list[str], available: set[str]) -> dict:
-    """For each candidate, test access. Prefer the list response, then a minimal probe call."""
-    out = {}
-    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    for mid in candidates:
-        if mid in available:
-            out[mid] = True
-        else:
-            # cheapest probe: retrieve model
-            try:
-                resp = await client.get(f"{BASE}/v1/models/{mid}", headers=hdrs, timeout=15.0)
-                if resp.status_code == 200:
-                    out[mid] = True
-                elif resp.status_code in (404, 403):
-                    out[mid] = False
-                elif resp.status_code == 401:
-                    out[mid] = False
-                else:
-                    out[mid] = False
-            except Exception:
-                out[mid] = False
-    return out
-
-
 async def check(key: str, proxy: str | None = None) -> dict:
     """Full OpenAI key check. Returns dict matching db.save_result schema."""
     result = {
@@ -314,9 +434,11 @@ async def check(key: str, proxy: str | None = None) -> dict:
             result["error"] = err or "dead"
             return result
 
-        result["extra"]["models_count"] = len(models)
+        supported = build_supported_models(models)
+        result["extra"]["supported_models"] = supported
+        result["extra"]["models_count"] = supported["all_count"]
         result["extra"]["org_id"] = org_id
-        result["extra"]["models_preview"] = models[:30]
+        result["extra"]["models_preview"] = _sorted_models(models)[:30]
 
         tier, rpm, tpm = await _detect_tier(client, key)
         # Prefer /v1/models headers if probes returned nothing
@@ -332,18 +454,17 @@ async def check(key: str, proxy: str | None = None) -> dict:
         result["rpm"] = rpm
         result["tpm"] = tpm
 
-        # Probe image + video + chat access concurrently (use known models list when possible)
-        available = set(models)
-        img_task = _probe_model_access(client, key, IMAGE_PROBE_IDS, available)
-        vid_task = _probe_model_access(client, key, VIDEO_PROBE_IDS, available)
-        chat_task = _probe_model_access(client, key, CHAT_PROBE_IDS, available)
-        img_access, vid_access, chat_access = await asyncio.gather(img_task, vid_task, chat_task)
-        result["extra"]["image_access"] = img_access
-        result["extra"]["video_access"] = vid_access
-        result["extra"]["chat_access"] = chat_access
-        result["extra"]["has_gpt_image_2"] = bool(img_access.get("gpt-image-2"))
-        result["extra"]["has_sora_2"] = bool(vid_access.get("sora-2") or vid_access.get("sora-2-pro"))
-        result["extra"]["has_gpt_5_5"] = bool(chat_access.get("gpt-5.5") or chat_access.get("gpt-5.5-mini"))
+        # Legacy compatibility flags derived from the dynamic /v1/models result.
+        groups = supported["groups"]
+        text_models = groups.get("text", []) + groups.get("reasoning", [])
+        image_models = groups.get("image", [])
+        video_models = groups.get("video", [])
+        result["extra"]["image_access"] = {mid: True for mid in image_models[:20]}
+        result["extra"]["video_access"] = {mid: True for mid in video_models[:20]}
+        result["extra"]["chat_access"] = {mid: True for mid in text_models[:20]}
+        result["extra"]["has_gpt_image_2"] = any(mid.startswith("gpt-image-2") for mid in image_models)
+        result["extra"]["has_sora_2"] = any(mid.startswith(("sora-2", "sora-2-pro")) for mid in video_models)
+        result["extra"]["has_gpt_5_5"] = any(mid.startswith(("gpt-5.5", "gpt-5.5-mini")) for mid in text_models)
 
         if tier == "no_quota":
             result["status"] = "no_quota"

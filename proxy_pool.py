@@ -4,26 +4,85 @@ import asyncio
 import os
 import random
 from typing import Optional
-
-import httpx
+from urllib.parse import quote, urlsplit
 
 PROXIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "proxies.txt")
 
 
+def _build_socks5_url(
+    host: str,
+    port: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Optional[str]:
+    host = host.strip()
+    port = port.strip()
+    if not host or not port:
+        return None
+    try:
+        port_number = int(port)
+    except ValueError:
+        return None
+    if port_number < 1 or port_number > 65535:
+        return None
+
+    if username is not None:
+        auth = quote(username.strip(), safe="")
+        if password is not None:
+            auth = f"{auth}:{quote(password.strip(), safe='')}"
+        return f"socks5://{auth}@{host}:{port}"
+    return f"socks5://{host}:{port}"
+
+
+def _split_host_port(value: str) -> Optional[tuple[str, str]]:
+    if ":" not in value:
+        return None
+    host, port = value.rsplit(":", 1)
+    if not host or not port.isdigit():
+        return None
+    return host, port
+
+
 def parse_proxy_line(line: str) -> Optional[str]:
-    """Parse 'host:port:pass:user' into socks5:// URL. Skip comments/empty."""
+    """Parse common SOCKS5 proxy formats into a URL. Skip comments/empty."""
     s = line.strip()
     if not s or s.startswith("#"):
         return None
+
+    if "://" in s:
+        try:
+            parsed = urlsplit(s)
+            if parsed.scheme in {"socks5", "socks5h"} and parsed.hostname and parsed.port:
+                return s
+        except ValueError:
+            return None
+        return None
+
+    if "@" in s:
+        left, right = s.rsplit("@", 1)
+        left_host_port = _split_host_port(left)
+        right_host_port = _split_host_port(right)
+
+        if left_host_port:
+            host, port = left_host_port
+            username, sep, password = right.partition(":")
+            return _build_socks5_url(host, port, username, password if sep else None)
+
+        if right_host_port:
+            host, port = right_host_port
+            username, sep, password = left.partition(":")
+            return _build_socks5_url(host, port, username, password if sep else None)
+
+        return None
+
     parts = s.split(":")
     if len(parts) == 4:
         host, port, pwd, user = parts
-        # URL-encode the password in case it contains special chars
-        from urllib.parse import quote
-        return f"socks5://{quote(user)}:{quote(pwd)}@{host}:{port}"
+        # Legacy local format: host:port:password:username
+        return _build_socks5_url(host, port, user, pwd)
     elif len(parts) == 2:
         host, port = parts
-        return f"socks5://{host}:{port}"
+        return _build_socks5_url(host, port)
     return None
 
 
@@ -100,6 +159,8 @@ class ProxyPool:
     async def health_check_one(self, proxy_url: str, timeout: float = 5.0) -> bool:
         """Test if a proxy is alive by connecting to a known host.
         Tries multiple targets for resilience."""
+        import httpx
+
         targets = [
             "https://httpbin.org/ip",
             "https://api.anthropic.com/v1/users/me",

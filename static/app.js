@@ -77,56 +77,188 @@ function tierBadge(t) {
 	return `<span class="tier ${cls}">${t}</span>`;
 }
 
+function escapeHtml(v) {
+	return String(v ?? "").replace(/[&<>"']/g, (c) => ({
+		"&": "&amp;",
+		"<": "&lt;",
+		">": "&gt;",
+		'"': "&quot;",
+		"'": "&#39;",
+	})[c]);
+}
+
+function chip(label, className = "", title = "") {
+	const cls = className ? ` ${className}` : "";
+	const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+	return `<span class="chip${cls}"${titleAttr}>${escapeHtml(label)}</span>`;
+}
+
+function modelGroupsTitle(groups) {
+	if (!groups) return "";
+	return Object.entries(groups)
+		.filter(([, models]) => Array.isArray(models) && models.length)
+		.map(([group, models]) => `${group}: ${models.join(", ")}`)
+		.join("\n");
+}
+
+function modelGroupFor(model, groups) {
+	for (const [group, models] of Object.entries(groups || {})) {
+		if (Array.isArray(models) && models.includes(model)) return group;
+	}
+	return "model";
+}
+
+const OPENAI_DISPLAY_TARGETS = [
+	{ label: "gpt-5.6", prefixes: ["gpt-5.6"] },
+	{ label: "gpt-5.5", prefixes: ["gpt-5.5", "gpt5.5"] },
+	{ label: "gpt-image-2", prefixes: ["gpt-image-2"] },
+	{ label: "sora-2", prefixes: ["sora-2"] },
+];
+
+function flattenModelGroups(groups) {
+	const out = [];
+	for (const models of Object.values(groups || {})) {
+		if (Array.isArray(models)) out.push(...models);
+	}
+	return Array.from(new Set(out.filter(Boolean)));
+}
+
+function targetMatches(model, prefix) {
+	const m = String(model || "").toLowerCase();
+	const p = String(prefix || "").toLowerCase();
+	return m === p || m.startsWith(`${p}-`) || m.startsWith(`${p}.`);
+}
+
+function findTargetModel(models, prefixes) {
+	for (const prefix of prefixes) {
+		const exact = models.find((model) => String(model).toLowerCase() === prefix);
+		if (exact) return exact;
+	}
+	for (const prefix of prefixes) {
+		const matched = models.find((model) => targetMatches(model, prefix));
+		if (matched) return matched;
+	}
+	return null;
+}
+
+function displayTargetsFromSupported(supported) {
+	if (Array.isArray(supported.display_targets)) return supported.display_targets;
+
+	const groups = supported.groups || {};
+	const models = flattenModelGroups(groups);
+	return OPENAI_DISPLAY_TARGETS.map((target) => {
+		const model = findTargetModel(models, target.prefixes);
+		return {
+			label: target.label,
+			model,
+			supported: Boolean(model),
+			group: model ? modelGroupFor(model, groups) : null,
+		};
+	});
+}
+
+function openaiModelChips(e) {
+	const supported = e.supported_models;
+	if (!supported) return [];
+
+	const groups = supported.groups || {};
+	const displayTargets = displayTargetsFromSupported(supported);
+	if (!displayTargets.length) return [];
+
+	const allCount = supported.all_count ?? flattenModelGroups(groups).length;
+	const title = modelGroupsTitle(groups);
+	const supportedCount = displayTargets.filter((target) => target.supported).length;
+	const chips = displayTargets.map((target) => {
+		const cls = target.supported ? `on model-chip model-${target.group || "model"}` : "off model-chip";
+		const targetTitle = target.model && target.model !== target.label
+			? `${target.label}: ${target.model}\n${title}`
+			: title;
+		return chip(target.label, cls, targetTitle);
+	});
+
+	const remaining = Math.max(allCount - supportedCount, 0);
+	if (remaining > 0) chips.push(chip(`+${remaining}`, "model-more", title));
+	return chips;
+}
+
+function targetModelChips(supported) {
+	if (!supported) return [];
+
+	const displayTargets = Array.isArray(supported.display_targets)
+		? supported.display_targets
+		: [];
+	if (!displayTargets.length) return [];
+
+	const title = Array.isArray(supported.models_preview)
+		? supported.models_preview.join("\n")
+		: "";
+	const supportedCount = displayTargets.filter((target) => target.supported).length;
+	const chips = displayTargets.map((target) => {
+		const targetTitle = target.model && target.model !== target.label
+			? `${target.label}: ${target.model}${target.display_name ? `\n${target.display_name}` : ""}${title ? `\n${title}` : ""}`
+			: title;
+		return chip(target.label, target.supported ? "on model-chip" : "off model-chip", targetTitle);
+	});
+
+	const allCount = supported.all_count ?? 0;
+	const remaining = Math.max(allCount - supportedCount, 0);
+	if (remaining > 0) chips.push(chip(`+${remaining}`, "model-more", title));
+	return chips;
+}
+
 function detailChips(r) {
 	const e = r.extra || {};
 	const chips = [];
 	if (r.provider === "openai") {
-		if (typeof e.has_gpt_5_5 !== "undefined") {
-			chips.push(
-				`<span class="chip ${e.has_gpt_5_5 ? "on" : "off"}">gpt-5.5</span>`,
-			);
-		}
-		if (typeof e.has_gpt_image_2 !== "undefined") {
-			chips.push(
-				`<span class="chip ${e.has_gpt_image_2 ? "on" : "off"}">gpt-image-2</span>`,
-			);
-		}
-		if (typeof e.has_sora_2 !== "undefined") {
-			chips.push(
-				`<span class="chip ${e.has_sora_2 ? "on" : "off"}">sora-2</span>`,
-			);
-		}
-		if (e.models_count) {
-			chips.push(`<span class="chip">📦 ${e.models_count}</span>`);
+		const dynamicModelChips = openaiModelChips(e);
+		if (dynamicModelChips.length) {
+			chips.push(...dynamicModelChips);
+		} else {
+			if (typeof e.has_gpt_5_5 !== "undefined") {
+				chips.push(chip("gpt-5.5", e.has_gpt_5_5 ? "on" : "off"));
+			}
+			if (typeof e.has_gpt_image_2 !== "undefined") {
+				chips.push(chip("gpt-image-2", e.has_gpt_image_2 ? "on" : "off"));
+			}
+			if (typeof e.has_sora_2 !== "undefined") {
+				chips.push(chip("sora-2", e.has_sora_2 ? "on" : "off"));
+			}
+			if (e.models_count) chips.push(chip(`📦 ${e.models_count}`));
 		}
 		if (e.org_id) {
-			chips.push(`<span class="chip" title="${e.org_id}">🆔</span>`);
+			chips.push(chip("🆔", "", e.org_id));
 		}
 		if (e.tier_reason) {
-			chips.push(
-				`<span class="chip off" title="${e.tier_reason}">? ${e.tier_reason}</span>`,
-			);
+			chips.push(chip(`? ${e.tier_reason}`, "off", e.tier_reason));
 		}
 		if (e.burst_probe) {
 			const bp = e.burst_probe;
 			chips.push(
-				`<span class="chip" title="burst probe: ok=${bp.ok} 429=${bp.hit_429} est=${bp.rpm_estimate}">burst ${bp.rpm_estimate ?? "?"}</span>`,
+				chip(
+					`burst ${bp.rpm_estimate ?? "?"}`,
+					"",
+					`burst probe: ok=${bp.ok} 429=${bp.hit_429} est=${bp.rpm_estimate}`,
+				),
 			);
 		}
 	} else if (r.provider === "gemini") {
-		if (e.probe_model) chips.push(`<span class="chip">${e.probe_model}</span>`);
+		if (e.probe_model) chips.push(chip(e.probe_model));
 		if (e.burst && e.burst.ceiling_hit)
-			chips.push(`<span class="chip on">429 hit</span>`);
-		if (e.models_count)
-			chips.push(`<span class="chip">📦 ${e.models_count}</span>`);
+			chips.push(chip("429 hit", "on"));
+		if (e.models_count) chips.push(chip(`📦 ${e.models_count}`));
 	} else if (r.provider === "anthropic") {
-		if (e.source) chips.push(`<span class="chip">${e.source}</span>`);
-		if (e.probe_model) chips.push(`<span class="chip">${e.probe_model}</span>`);
+		const dynamicModelChips = targetModelChips(e.supported_models);
+		if (dynamicModelChips.length) {
+			chips.push(...dynamicModelChips);
+		} else if (e.models_error) {
+			chips.push(chip("models unavailable", "off", e.models_error));
+		} else if (e.probe_model) {
+			chips.push(chip("retest for models", "off", e.probe_model));
+		}
+		if (e.source) chips.push(chip(e.source, "", e.probe_model || ""));
 	}
 	if (r.error)
-		chips.push(
-			`<span class="chip off" title="${r.error}">❗ ${r.error.slice(0, 24)}</span>`,
-		);
+		chips.push(chip(`❗ ${r.error.slice(0, 24)}`, "off", r.error));
 	return `<div class="detail-chips">${chips.join("")}</div>`;
 }
 
