@@ -10,21 +10,22 @@
       href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Noto+Sans+SC:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/style.css?v=20260710-inventory-ops" />
+    <link rel="stylesheet" href="/static/style.css?v=20260712-bedrock-sales-a11y" />
   </head>
   <body>
     <!-- Auth gate -->
-    <div id="auth-overlay" class="auth-overlay">
+    <div id="auth-overlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title">
       <div class="auth-box panel">
-        <h2>🔐 管理员验证</h2>
+        <h2 id="auth-title">🔐 管理员验证</h2>
         <p class="muted">请输入管理密钥以继续</p>
         <input
           id="auth-input"
           type="password"
+          aria-label="管理员密钥"
           placeholder="管理密钥…"
           autocomplete="off"
         />
-        <div id="auth-error" class="auth-error hidden">密钥错误，请重试</div>
+        <div id="auth-error" class="auth-error hidden" role="alert">密钥错误，请重试</div>
         <button
           id="auth-btn"
           class="btn btn-primary"
@@ -38,15 +39,21 @@
     <header class="topbar">
       <h1>🔑 API Key Tier Detector</h1>
       <div class="brand-sub">
-        OpenAI · Claude · Gemini · 自动识别 / 批量探测 / 等级判定
+        OpenAI · Claude · Gemini · AWS Bedrock · 自动识别 / 批量探测 / 库存销售
       </div>
-      <nav class="tabs">
-        <button class="tab active" data-tab="check">🔍 检测</button>
-        <button class="tab" data-tab="vault">
+      <nav class="tabs" role="tablist" aria-label="主要功能">
+        <button id="tab-check" class="tab active" type="button" role="tab" data-tab="check" aria-controls="view-check" aria-selected="true">🔍 检测</button>
+        <button id="tab-vault" class="tab" type="button" role="tab" data-tab="vault" aria-controls="view-vault" aria-selected="false" tabindex="-1">
           🗝️ 密钥库 <span id="vault-count-badge" class="count-pill">0</span>
         </button>
-        <button class="tab" data-tab="inventory">
+        <button id="tab-inventory" class="tab" type="button" role="tab" data-tab="inventory" aria-controls="view-inventory" aria-selected="false" tabindex="-1">
           库存 <span id="inventory-count-badge" class="count-pill">0</span>
+        </button>
+        <button id="tab-sellable" class="tab" type="button" role="tab" data-tab="sellable" aria-controls="view-inventory" aria-selected="false" tabindex="-1">
+          可售出 <span id="sellable-count-badge" class="count-pill">0</span>
+        </button>
+        <button id="tab-sold" class="tab" type="button" role="tab" data-tab="sold" aria-controls="view-inventory" aria-selected="false" tabindex="-1">
+          已售出 <span id="sold-count-badge" class="count-pill">0</span>
         </button>
       </nav>
     </header>
@@ -76,7 +83,7 @@
           </label>
         </div>
         <div class="muted form-hint">入库时间和批次由系统自动生成。</div>
-        <div id="inbound-error" class="auth-error hidden">请填写供应商</div>
+        <div id="inbound-error" class="auth-error hidden" role="alert">请填写供应商</div>
         <div class="modal-actions">
           <button id="inbound-cancel" class="btn" type="button">取消</button>
           <button id="inbound-submit" class="btn btn-primary" type="button">确认入库</button>
@@ -94,9 +101,64 @@
       </div>
     </div>
 
+    <div id="sale-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="sale-title">
+      <div class="modal-box panel">
+        <div class="modal-head">
+          <h2 id="sale-title">售出选中库存</h2>
+          <button id="sale-close" class="btn btn-icon" type="button" aria-label="关闭售出窗口">×</button>
+        </div>
+        <p id="sale-selection-summary" class="form-summary"></p>
+        <div class="form-grid">
+          <label>
+            买家 <span class="required" aria-hidden="true">*</span>
+            <input id="sale-buyer" type="text" autocomplete="off" aria-required="true" placeholder="买家名称或识别信息" />
+          </label>
+          <label>
+            每 Key 售价（CNY）
+            <input id="sale-unit-price" type="number" min="0" step="0.01" inputmode="decimal" placeholder="可空" />
+          </label>
+          <label>
+            外部参考号
+            <input id="sale-external-ref" type="text" autocomplete="off" placeholder="订单号等，可空" />
+          </label>
+          <label class="form-wide">
+            销售备注
+            <input id="sale-note" type="text" autocomplete="off" placeholder="可空" />
+          </label>
+        </div>
+        <div id="sale-error" class="auth-error hidden" role="alert"></div>
+        <div class="modal-actions">
+          <button id="sale-cancel" class="btn" type="button">取消</button>
+          <button id="sale-submit" class="btn btn-primary" type="button">确认售出</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="return-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="return-title">
+      <div class="modal-box panel">
+        <div class="modal-head">
+          <h2 id="return-title">退回已售库存</h2>
+          <button id="return-close" class="btn btn-icon" type="button" aria-label="关闭退回窗口">×</button>
+        </div>
+        <p id="return-selection-summary" class="form-summary"></p>
+        <label class="stacked-field" for="return-reason">
+          退回原因 <span class="required" aria-hidden="true">*</span>
+        </label>
+        <textarea id="return-reason" rows="3" aria-required="true" placeholder="请记录退回原因"></textarea>
+        <p class="muted form-hint">退回后不会自动恢复可售；请先复检，再使用“恢复可售”。</p>
+        <div id="return-error" class="auth-error hidden" role="alert"></div>
+        <div class="modal-actions">
+          <button id="return-cancel" class="btn" type="button">取消</button>
+          <button id="return-submit" class="btn btn-danger" type="button">确认退回</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
     <main class="layout">
       <!-- ════════════════ CHECK VIEW ════════════════ -->
-      <div id="view-check" class="view">
+      <div id="view-check" class="view" role="tabpanel" aria-labelledby="tab-check">
         <!-- Import panel -->
         <section class="panel">
           <div class="panel-title">① 粘贴 Key（每行一个）</div>
@@ -105,7 +167,8 @@
             rows="8"
             placeholder="sk-proj-...
 sk-ant-api03-...
-AIzaSy..."
+AIzaSy...
+AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           ></textarea>
 
           <div class="row">
@@ -114,7 +177,7 @@ AIzaSy..."
               <input id="concurrency" type="number" min="1" max="32" value="4"
             /></label>
             <label class="proxy-toggle">
-              <input id="use-proxy" type="checkbox" /> 使用 SOCKS5 代理池
+              <input id="use-proxy" type="checkbox" aria-label="使用 SOCKS5 代理池" /> 使用 SOCKS5 代理池
             </label>
             <button id="btn-import" class="btn btn-primary">开始检测</button>
             <button id="btn-refresh" class="btn">刷新</button>
@@ -122,7 +185,7 @@ AIzaSy..."
 
           <div id="job-status" class="job-status hidden">
             <div class="job-bar"><div id="job-bar-fill"></div></div>
-            <div id="job-text">--</div>
+            <div id="job-text" role="status" aria-live="polite">--</div>
           </div>
         </section>
 
@@ -136,6 +199,7 @@ AIzaSy..."
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
+                <option value="aws_bedrock">AWS Bedrock</option>
               </select>
             </label>
             <label
@@ -172,6 +236,7 @@ AIzaSy..."
             <button id="btn-select-all" class="btn">全选</button>
             <button id="btn-copy" class="btn">复制选中</button>
             <button id="btn-retest" class="btn btn-secondary">重新测试</button>
+            <button id="btn-bedrock-deep" class="btn btn-aws">Bedrock 深检</button>
             <button id="btn-delete" class="btn btn-danger">删除</button>
           </div>
           <div class="stats" id="stats">—</div>
@@ -182,7 +247,7 @@ AIzaSy..."
           <table id="keys-table">
             <thead>
               <tr>
-                <th class="col-cb"><input id="cb-all" type="checkbox" /></th>
+                <th class="col-cb"><label class="checkbox-hitarea"><input id="cb-all" type="checkbox" aria-label="选择全部检测结果" /></label></th>
                 <th>厂商</th>
                 <th>Key</th>
                 <th>状态</th>
@@ -202,11 +267,11 @@ AIzaSy..."
       </div>
 
       <!-- ════════════════ VAULT VIEW ════════════════ -->
-      <div id="view-vault" class="view hidden">
+      <div id="view-vault" class="view hidden" role="tabpanel" aria-labelledby="tab-vault">
         <section class="panel">
           <div class="filterbar">
-            <strong style="font-size: 15px">🗝️ 密钥库</strong>
-            <span class="muted">所有检测通过的有效 Key 会自动归档到这里</span>
+            <strong id="v-view-title" style="font-size: 15px">🗝️ 密钥库</strong>
+            <span id="v-view-description" class="muted">所有检测通过的有效 Key 会自动归档到这里</span>
             <span class="spacer"></span>
 
             <label
@@ -216,6 +281,14 @@ AIzaSy..."
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
+                <option value="aws_bedrock">AWS Bedrock</option>
+              </select>
+            </label>
+            <label
+              >待核对
+              <select id="v-legacy-sale">
+                <option value="">全部</option>
+                <option value="true">旧售出备注</option>
               </select>
             </label>
             <label
@@ -242,6 +315,7 @@ AIzaSy..."
             <button id="v-btn-retest" class="btn btn-secondary">
               重新测试
             </button>
+            <button id="v-btn-bedrock-deep" class="btn btn-aws">Bedrock 深检</button>
             <button id="v-btn-inbound" class="btn btn-primary">选中入库</button>
             <button id="v-btn-export" class="btn">导出 .txt</button>
             <button id="v-btn-delete" class="btn btn-danger">从库中删除</button>
@@ -254,7 +328,7 @@ AIzaSy..."
           <table id="vault-table">
             <thead>
               <tr>
-                <th class="col-cb"><input id="v-cb-all" type="checkbox" /></th>
+                <th class="col-cb"><label class="checkbox-hitarea"><input id="v-cb-all" type="checkbox" aria-label="选择全部密钥库结果" /></label></th>
                 <th>厂商</th>
                 <th>Key</th>
                 <th>等级</th>
@@ -264,23 +338,24 @@ AIzaSy..."
                 <th>次数</th>
                 <th>首次验证</th>
                 <th>最近验证</th>
+                <th>库存</th>
                 <th>备注</th>
               </tr>
             </thead>
             <tbody></tbody>
           </table>
           <div id="v-empty" class="empty">
-            密钥库为空。检测通过的 Key 会自动入库。
+            密钥库为空。检测通过的 Key 会自动加入密钥库。
           </div>
         </section>
       </div>
 
       <!-- ════════════════ INVENTORY VIEW ════════════════ -->
-      <div id="view-inventory" class="view hidden">
+      <div id="view-inventory" class="view hidden" role="tabpanel" aria-labelledby="tab-inventory">
         <section class="panel">
           <div class="filterbar">
-            <strong style="font-size: 15px">库存</strong>
-            <span class="muted">从密钥库正式入库后的 Key 会显示在这里</span>
+            <strong id="i-view-title" style="font-size: 15px">库存</strong>
+            <span id="i-view-description" class="muted">从密钥库正式入库后的 Key 会显示在这里</span>
             <span class="spacer"></span>
 
             <label
@@ -290,6 +365,7 @@ AIzaSy..."
                 <option value="openai">OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
+                <option value="aws_bedrock">AWS Bedrock</option>
               </select>
             </label>
             <label
@@ -298,6 +374,8 @@ AIzaSy..."
                 <option value="">全部</option>
                 <option value="in_stock">可售</option>
                 <option value="reserved">已预留</option>
+                <option value="sold">已售出</option>
+                <option value="returned">已退回</option>
                 <option value="no_quota">无额度</option>
                 <option value="invalid">失效</option>
                 <option value="quarantined">隔离</option>
@@ -344,7 +422,10 @@ AIzaSy..."
           <div class="filterbar inventory-actions">
             <button id="i-btn-select-all" class="btn" type="button">全选</button>
             <button id="i-btn-recheck" class="btn btn-secondary" type="button">批量复检</button>
+            <button id="i-btn-bedrock-deep" class="btn btn-aws" type="button">Bedrock 深检</button>
             <button id="i-btn-reserve" class="btn" type="button">预留</button>
+            <button id="i-btn-sell" class="btn btn-primary" type="button">售出</button>
+            <button id="i-btn-return" class="btn btn-danger" type="button">退回</button>
             <button id="i-btn-restore" class="btn btn-primary" type="button">恢复可售</button>
             <button id="i-btn-quarantine" class="btn" type="button">隔离</button>
             <button id="i-btn-archive" class="btn btn-danger" type="button">归档</button>
@@ -360,7 +441,7 @@ AIzaSy..."
           <table id="inventory-table">
             <thead>
               <tr>
-                <th class="col-cb"><input id="i-cb-all" type="checkbox" /></th>
+                <th class="col-cb"><label class="checkbox-hitarea"><input id="i-cb-all" type="checkbox" aria-label="选择全部库存结果" /></label></th>
                 <th>厂商</th>
                 <th>Key</th>
                 <th>库存状态</th>
@@ -371,6 +452,9 @@ AIzaSy..."
                 <th>批次</th>
                 <th>成本</th>
                 <th>供应商</th>
+                <th>买家</th>
+                <th>售价</th>
+                <th>售出时间</th>
                 <th>标签</th>
                 <th>最近检测</th>
                 <th>备注</th>
@@ -386,6 +470,6 @@ AIzaSy..."
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260710-check-result-top"></script>
+    <script src="/static/app.js?v=20260712-bedrock-sales-a11y"></script>
   </body>
 </html>

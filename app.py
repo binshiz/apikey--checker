@@ -12,8 +12,10 @@ Routes:
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -30,10 +32,11 @@ def require_auth(request: Request):
     token = request.headers.get("X-Admin-Key", "")
     if token != ADMIN_KEY:
         raise HTTPException(401, "unauthorized")
-from detector import detect_provider, short_key
+from detector import detect_provider, normalize_key, short_key
 from checkers import openai as openai_checker
 from checkers import anthropic as anthropic_checker
 from checkers import gemini as gemini_checker
+from checkers import bedrock as bedrock_checker
 from proxy_pool import get_pool, ProxyPool
 
 
@@ -41,9 +44,50 @@ CHECKERS = {
     "openai": openai_checker.check,
     "anthropic": anthropic_checker.check,
     "gemini": gemini_checker.check,
+    "aws_bedrock": bedrock_checker.check,
 }
 
+CHECKER_SUPPORTS_PROXY = {
+    "openai": True,
+    "anthropic": True,
+    "gemini": True,
+    "aws_bedrock": False,
+}
+
+CheckMode = Literal["quick", "bedrock_deep"]
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+_SOCKS_URL_RE = re.compile(r"\bsocks5h?://[^\s\"']+", re.IGNORECASE)
+
+
+def _redact_proxy_urls(value: str | None) -> str | None:
+    """Remove SOCKS endpoints (including credentials) from persisted/public text."""
+    if not value:
+        return value
+    return _SOCKS_URL_RE.sub("[proxy redacted]", str(value))
+
+
+def _sanitize_result_extra(value: Any) -> Any:
+    """Recursively strip proxy locations while preserving non-secret status flags."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_name = str(key)
+            lowered = key_name.lower()
+            if lowered in {"proxy", "proxy_url", "proxy_uri"}:
+                continue
+            if lowered == "proxy_dead" and isinstance(item, str):
+                sanitized[key_name] = True
+                continue
+            sanitized[key_name] = _sanitize_result_extra(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_result_extra(item) for item in value]
+    if isinstance(value, str):
+        return _redact_proxy_urls(value)
+    return value
 
 
 @asynccontextmanager
@@ -64,7 +108,13 @@ templates = Jinja2Templates(directory=os.path.join(ROOT, "templates"))
 # Background checker
 # ────────────────────────────────────────────────────────────────────
 
-async def check_one_key(key_id: int, job_id: int | None, sem: asyncio.Semaphore, use_proxy: bool = False):
+async def check_one_key(
+    key_id: int,
+    job_id: int | None,
+    sem: asyncio.Semaphore,
+    use_proxy: bool = False,
+    mode: CheckMode = "quick",
+):
     async with sem:
         info = db.get_key(key_id)
         if not info:
@@ -77,7 +127,7 @@ async def check_one_key(key_id: int, job_id: int | None, sem: asyncio.Semaphore,
                 "status": "invalid",
                 "error": f"unknown provider format",
                 "extra": {},
-            })
+            }, source="checker")
             if job_id:
                 db.bump_job(job_id)
             return
@@ -86,35 +136,56 @@ async def check_one_key(key_id: int, job_id: int | None, sem: asyncio.Semaphore,
 
         # Pick a proxy from the pool if enabled
         proxy = None
-        if use_proxy:
+        if use_proxy and CHECKER_SUPPORTS_PROXY.get(provider, False):
             proxy = await get_pool().get_round_robin()
 
         try:
+            checker = (
+                bedrock_checker.deep_check
+                if provider == "aws_bedrock" and mode == "bedrock_deep"
+                else CHECKERS[provider]
+            )
             if proxy:
-                result = await CHECKERS[provider](info["api_key"], proxy=proxy)
+                result = await checker(info["api_key"], proxy=proxy)
             else:
-                result = await CHECKERS[provider](info["api_key"])
+                result = await checker(info["api_key"])
         except Exception as e:
-            result = {"status": "error", "error": f"{type(e).__name__}: {e}", "extra": {}}
+            result = {
+                "status": "error",
+                "error": _redact_proxy_urls(f"{type(e).__name__}: {e}"),
+                "extra": {},
+            }
             if proxy:
                 await get_pool().mark_dead(proxy)
-                result["extra"]["proxy_dead"] = proxy
+                result["extra"]["proxy_dead"] = True
 
         # If the error looks like a proxy/connection failure, mark it dead
         err_str = (result.get("error") or "").lower()
         if proxy and (result.get("status") in ("error",) or "proxyerror" in err_str or "connect" in err_str or "timeout" in err_str):
             await get_pool().mark_dead(proxy)
-            result.setdefault("extra", {})["proxy"] = proxy
-            result["extra"]["proxy_dead"] = proxy
+            result.setdefault("extra", {})["proxy_dead"] = True
 
-        db.save_result(key_id, result)
+        result["error"] = _redact_proxy_urls(result.get("error"))
+        result["extra"] = _sanitize_result_extra(result.get("extra") or {})
+
+        source = "bedrock_deep" if provider == "aws_bedrock" and mode == "bedrock_deep" else "checker"
+        db.save_result(key_id, result, source=source)
         if job_id:
             db.bump_job(job_id)
 
 
-async def run_job(key_ids: list[int], concurrency: int, job_id: int, use_proxy: bool = False):
+async def run_job(
+    key_ids: list[int],
+    concurrency: int,
+    job_id: int,
+    use_proxy: bool = False,
+    mode: CheckMode = "quick",
+):
     sem = asyncio.Semaphore(concurrency)
-    tasks = [check_one_key(kid, job_id, sem, use_proxy=use_proxy) for kid in key_ids]
+    tasks = [
+        check_one_key(kid, job_id, sem, use_proxy=use_proxy, mode=mode)
+        for kid in key_ids
+    ]
     await asyncio.gather(*tasks, return_exceptions=True)
     db.finish_job(job_id)
 
@@ -123,7 +194,7 @@ def _parse_keys_text(text: str) -> tuple[list[str], dict[str, str | None]]:
     keys = []
     providers = {}
     for line in text.splitlines():
-        s = line.strip()
+        s = normalize_key(line)
         if not s or s.startswith("#"):
             continue
         if s in providers:
@@ -132,6 +203,23 @@ def _parse_keys_text(text: str) -> tuple[list[str], dict[str, str | None]]:
         providers[s] = prov
         keys.append(s)
     return keys, providers
+
+
+def _filter_key_ids_for_mode(ids: list[int], mode: CheckMode) -> tuple[list[int], int]:
+    unique_ids = list(dict.fromkeys(ids))
+    if mode == "quick":
+        return unique_ids, 0
+    accepted = []
+    for key_id in unique_ids:
+        row = db.get_key(key_id)
+        if row and row.get("provider") == "aws_bedrock":
+            accepted.append(key_id)
+    return accepted, len(unique_ids) - len(accepted)
+
+
+def _effective_concurrency(requested: int, mode: CheckMode) -> int:
+    upper_bound = 2 if mode == "bedrock_deep" else 32
+    return min(max(1, requested), upper_bound)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -148,6 +236,7 @@ class IdsPayload(BaseModel):
     ids: list[int]
     concurrency: int = 4
     use_proxy: bool = False
+    mode: CheckMode = "quick"
 
 
 class VaultInboundPayload(BaseModel):
@@ -175,6 +264,20 @@ class InventoryExportPayload(BaseModel):
     format: str = "txt"
 
 
+class InventorySalePayload(BaseModel):
+    ids: list[int]
+    buyer: str
+    unit_price: Decimal | None = None
+    currency: Literal["CNY"] = "CNY"
+    external_ref: str | None = None
+    note: str | None = None
+
+
+class InventoryReturnPayload(BaseModel):
+    ids: list[int]
+    reason: str
+
+
 # ────────────────────────────────────────────────────────────────────
 # Routes
 # ────────────────────────────────────────────────────────────────────
@@ -200,8 +303,17 @@ async def import_keys(payload: ImportPayload):
 
     ids = db.upsert_keys(keys, providers)
     valid_ids = [i for i in ids if i is not None]
-    job_id = db.create_job(len(valid_ids), payload.concurrency)
-    asyncio.create_task(run_job(valid_ids, max(1, payload.concurrency), job_id, use_proxy=payload.use_proxy))
+    concurrency = _effective_concurrency(payload.concurrency, "quick")
+    job_id = db.create_job(len(valid_ids), concurrency, mode="quick")
+    asyncio.create_task(
+        run_job(
+            valid_ids,
+            concurrency,
+            job_id,
+            use_proxy=payload.use_proxy,
+            mode="quick",
+        )
+    )
 
     breakdown = {}
     for p in providers.values():
@@ -214,17 +326,35 @@ async def import_keys(payload: ImportPayload):
 async def recheck_keys(payload: IdsPayload):
     if not payload.ids:
         raise HTTPException(400, "no ids")
+    key_ids, skipped = _filter_key_ids_for_mode(payload.ids, payload.mode)
+    if not key_ids:
+        return {"job_id": None, "queued": 0, "skipped": skipped}
     # Reset status to pending for visibility.
-    for kid in payload.ids:
+    for kid in key_ids:
         db.set_key_status(kid, "pending")
-    job_id = db.create_job(len(payload.ids), payload.concurrency)
-    asyncio.create_task(run_job(payload.ids, max(1, payload.concurrency), job_id, use_proxy=payload.use_proxy))
-    return {"job_id": job_id, "queued": len(payload.ids)}
+    concurrency = _effective_concurrency(payload.concurrency, payload.mode)
+    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    asyncio.create_task(
+        run_job(
+            key_ids,
+            concurrency,
+            job_id,
+            use_proxy=payload.use_proxy,
+            mode=payload.mode,
+        )
+    )
+    return {"job_id": job_id, "queued": len(key_ids), "skipped": skipped}
 
 
 @app.post("/api/keys/delete", dependencies=[Depends(require_auth)])
-async def delete_keys(payload: IdsPayload):
+async def delete_keys(payload: IdsPayload, request: Request):
     n = db.delete_keys(payload.ids)
+    _audit_request(
+        request,
+        action="bulk_delete",
+        target_type="keys",
+        metadata={"requested": len(payload.ids), "deleted": n},
+    )
     return {"deleted": n}
 
 
@@ -239,7 +369,10 @@ async def get_keys(provider: str | None = None, status: str | None = None, tier:
                 r["extra"] = {}
         else:
             r["extra"] = {}
-        r["api_key_short"] = short_key(r["api_key"])
+        r["extra"] = _sanitize_result_extra(r["extra"])
+        r["error"] = _redact_proxy_urls(r.get("error"))
+        api_key = r.pop("api_key", "")
+        r["api_key_short"] = short_key(api_key)
     return {"keys": rows, "count": len(rows)}
 
 
@@ -256,13 +389,18 @@ async def running_jobs():
     return {"jobs": db.get_running_jobs()}
 
 
-@app.get("/api/export", dependencies=[Depends(require_auth)])
-async def export_keys(format: str = "txt", provider: str | None = None, tier: str | None = None):
-    rows = db.list_keys(provider=provider, tier=tier, status="valid")
-    if format == "json":
-        return JSONResponse(rows)
-    body = "\n".join(r["api_key"] for r in rows)
-    return PlainTextResponse(body)
+@app.post("/api/keys/export", dependencies=[Depends(require_auth)])
+async def export_keys(payload: InventoryExportPayload, request: Request):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    rows = db.get_key_entries(payload.ids)
+    _audit_request(
+        request,
+        action="full_key_export",
+        target_type="keys",
+        metadata={"count": len(rows), "format": payload.format},
+    )
+    return _secret_export_response(rows, payload.format)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -274,8 +412,16 @@ class NotePayload(BaseModel):
 
 
 @app.get("/api/vault", dependencies=[Depends(require_auth)])
-async def vault_list(provider: str | None = None, tier: str | None = None):
-    rows = db.list_vault(provider=provider, tier=tier)
+async def vault_list(
+    provider: str | None = None,
+    tier: str | None = None,
+    legacy_sale_candidate: bool = False,
+):
+    rows = db.list_vault(
+        provider=provider,
+        tier=tier,
+        legacy_sale_candidate=legacy_sale_candidate,
+    )
     for r in rows:
         if r.get("extra"):
             try:
@@ -284,13 +430,21 @@ async def vault_list(provider: str | None = None, tier: str | None = None):
                 r["extra"] = {}
         else:
             r["extra"] = {}
-        r["api_key_short"] = short_key(r["api_key"])
+        r["extra"] = _sanitize_result_extra(r["extra"])
+        api_key = r.pop("api_key", "")
+        r["api_key_short"] = short_key(api_key)
     return {"keys": rows, "count": len(rows), "stats": db.vault_stats()}
 
 
 @app.post("/api/vault/delete", dependencies=[Depends(require_auth)])
-async def vault_delete(payload: IdsPayload):
+async def vault_delete(payload: IdsPayload, request: Request):
     n = db.delete_vault(payload.ids)
+    _audit_request(
+        request,
+        action="bulk_delete",
+        target_type="vault",
+        metadata={"requested": len(payload.ids), "deleted": n},
+    )
     return {"deleted": n}
 
 
@@ -303,14 +457,34 @@ async def vault_recheck(payload: IdsPayload):
     entries = db.get_vault_entries(payload.ids)
     if not entries:
         raise HTTPException(404, "no vault entries")
+    skipped = 0
+    if payload.mode == "bedrock_deep":
+        accepted = [entry for entry in entries if entry.get("provider") == "aws_bedrock"]
+        skipped = len(entries) - len(accepted)
+        entries = accepted
+    if not entries:
+        return {"job_id": None, "queued": 0, "skipped": skipped}
     providers = {e["api_key"]: e["provider"] for e in entries}
     key_ids = db.upsert_keys([e["api_key"] for e in entries], providers)
+    key_ids, post_skipped = _filter_key_ids_for_mode(key_ids, payload.mode)
+    skipped += post_skipped
+    if not key_ids:
+        return {"job_id": None, "queued": 0, "skipped": skipped}
     # Reset to pending so the UI shows them as queued.
     for kid in key_ids:
         db.set_key_status(kid, "pending")
-    job_id = db.create_job(len(key_ids), payload.concurrency)
-    asyncio.create_task(run_job(key_ids, max(1, payload.concurrency), job_id, use_proxy=payload.use_proxy))
-    return {"job_id": job_id, "queued": len(key_ids)}
+    concurrency = _effective_concurrency(payload.concurrency, payload.mode)
+    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    asyncio.create_task(
+        run_job(
+            key_ids,
+            concurrency,
+            job_id,
+            use_proxy=payload.use_proxy,
+            mode=payload.mode,
+        )
+    )
+    return {"job_id": job_id, "queued": len(key_ids), "skipped": skipped}
 
 
 @app.post("/api/vault/note/{vault_id}", dependencies=[Depends(require_auth)])
@@ -320,38 +494,93 @@ async def vault_note(vault_id: int, payload: NotePayload):
 
 
 @app.post("/api/vault/inbound", dependencies=[Depends(require_auth)])
-async def vault_inbound(payload: VaultInboundPayload):
+async def vault_inbound(payload: VaultInboundPayload, request: Request):
     if not payload.ids:
         raise HTTPException(400, "no ids")
     if not payload.supplier_name.strip():
         raise HTTPException(400, "supplier_name required")
     try:
-        return db.inbound_from_vault(
+        result = db.inbound_from_vault(
             payload.ids,
             payload.supplier_name,
             total_cost=payload.total_cost,
             tags=payload.tags,
             note=payload.note,
         )
+        _audit_request(
+            request,
+            action="inventory_inbound",
+            target_type="inventory",
+            metadata={
+                "requested": len(payload.ids),
+                "inbounded": result.get("inbounded", 0),
+                "skipped": result.get("skipped", 0),
+                "batch_id": (result.get("batch") or {}).get("id"),
+            },
+        )
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
 
 
-@app.get("/api/vault/export")
-async def vault_export(format: str = "txt", provider: str | None = None, tier: str | None = None, token: str | None = None, request: Request = None):
-    header_key = request.headers.get("X-Admin-Key", "") if request else ""
-    if (token or "") != ADMIN_KEY and header_key != ADMIN_KEY:
-        raise HTTPException(401, "unauthorized")
-    rows = db.list_vault(provider=provider, tier=tier)
-    if format == "json":
-        return JSONResponse(rows)
-    body = "\n".join(r["api_key"] for r in rows)
-    return PlainTextResponse(body)
+@app.post("/api/vault/export", dependencies=[Depends(require_auth)])
+async def vault_export(payload: InventoryExportPayload, request: Request):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    rows = db.get_vault_entries(payload.ids)
+    _audit_request(
+        request,
+        action="full_key_export",
+        target_type="vault",
+        metadata={"count": len(rows), "format": payload.format},
+    )
+    return _secret_export_response(rows, payload.format)
 
 
 # ────────────────────────────────────────────────────────────────────
 # Inventory — formally inbounded keys
 # ────────────────────────────────────────────────────────────────────
+
+def _audit_request(
+    request: Request,
+    *,
+    action: str,
+    target_type: str,
+    target_id: int | None = None,
+    metadata: dict | None = None,
+):
+    client_host = request.client.host if request.client else None
+    db.record_audit(
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata,
+        actor="admin",
+        ip_address=client_host,
+    )
+
+
+def _secret_export_response(rows: list[dict], format: str):
+    if format == "json":
+        return JSONResponse(rows)
+    if format != "txt":
+        raise HTTPException(400, "unsupported format")
+    return PlainTextResponse("\n".join(row["api_key"] for row in rows))
+
+
+def _unit_price_to_minor(value: Decimal | None) -> int | None:
+    if value is None:
+        return None
+    if not value.is_finite():
+        raise HTTPException(400, "unit_price must be finite")
+    if value < 0:
+        raise HTTPException(400, "unit_price must be non-negative")
+    cents = value * 100
+    if cents != cents.to_integral_value():
+        raise HTTPException(400, "unit_price supports at most 2 decimal places")
+    if cents > 9_999_999_999_999:
+        raise HTTPException(400, "unit_price is too large")
+    return int(cents)
 
 def _parse_json_field(value: str | None) -> Any:
     if not value:
@@ -363,7 +592,8 @@ def _parse_json_field(value: str | None) -> Any:
 
 
 def _safe_inventory_row(row: dict, *, include_full_key: bool = False) -> dict:
-    row["extra"] = _parse_json_field(row.get("extra"))
+    row["extra"] = _sanitize_result_extra(_parse_json_field(row.get("extra")))
+    row["error"] = _redact_proxy_urls(row.get("error"))
     row["api_key_short"] = short_key(row.get("api_key") or "")
     if not include_full_key:
         row.pop("api_key", None)
@@ -371,7 +601,8 @@ def _safe_inventory_row(row: dict, *, include_full_key: bool = False) -> dict:
 
 
 def _safe_check_run(row: dict) -> dict:
-    row["extra"] = _parse_json_field(row.get("extra"))
+    row["extra"] = _sanitize_result_extra(_parse_json_field(row.get("extra")))
+    row["error"] = _redact_proxy_urls(row.get("error"))
     row.pop("proxy", None)
     return row
 
@@ -389,6 +620,7 @@ async def inventory_list(
     supplier_id: int | None = None,
     batch_id: int | None = None,
     risk_flag: str | None = None,
+    sale_view: Literal["all", "sellable", "sold"] = "all",
 ):
     rows = db.list_inventory(
         provider=provider,
@@ -397,6 +629,7 @@ async def inventory_list(
         supplier_id=supplier_id,
         batch_id=batch_id,
         risk_flag=risk_flag,
+        sale_view=sale_view,
     )
     for r in rows:
         _safe_inventory_row(r)
@@ -411,28 +644,62 @@ async def inventory_detail(inventory_id: int):
     item = _safe_inventory_row(detail["item"])
     check_runs = [_safe_check_run(r) for r in detail["check_runs"]]
     movements = [_safe_movement(r) for r in detail["movements"]]
-    return {"item": item, "check_runs": check_runs, "movements": movements}
+    sales = detail.get("sales", [])
+    return {"item": item, "check_runs": check_runs, "movements": movements, "sales": sales}
 
 
 @app.post("/api/inventory/recheck", dependencies=[Depends(require_auth)])
 async def inventory_recheck(payload: IdsPayload):
     if not payload.ids:
         raise HTTPException(400, "no ids")
-    prepared = db.prepare_inventory_recheck(payload.ids)
+    inventory_ids = list(dict.fromkeys(payload.ids))
+    mode_skipped = 0
+    if payload.mode == "bedrock_deep":
+        rows = db.export_inventory_entries(inventory_ids)
+        accepted_ids = [row["id"] for row in rows if row.get("provider") == "aws_bedrock"]
+        mode_skipped = len(inventory_ids) - len(accepted_ids)
+        inventory_ids = accepted_ids
+    if not inventory_ids:
+        return {"job_id": None, "queued": 0, "skipped": mode_skipped}
+    prepared = db.prepare_inventory_recheck(inventory_ids)
     key_ids = prepared["key_ids"]
     if not key_ids:
-        return {"job_id": None, "queued": 0, "skipped": prepared["skipped"]}
-    job_id = db.create_job(len(key_ids), payload.concurrency)
-    asyncio.create_task(run_job(key_ids, max(1, payload.concurrency), job_id, use_proxy=payload.use_proxy))
-    return {"job_id": job_id, "queued": len(key_ids), "skipped": prepared["skipped"]}
+        return {"job_id": None, "queued": 0, "skipped": prepared["skipped"] + mode_skipped}
+    concurrency = _effective_concurrency(payload.concurrency, payload.mode)
+    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    asyncio.create_task(
+        run_job(
+            key_ids,
+            concurrency,
+            job_id,
+            use_proxy=payload.use_proxy,
+            mode=payload.mode,
+        )
+    )
+    return {
+        "job_id": job_id,
+        "queued": len(key_ids),
+        "skipped": prepared["skipped"] + mode_skipped,
+    }
 
 
 @app.post("/api/inventory/status", dependencies=[Depends(require_auth)])
-async def inventory_status(payload: InventoryStatusPayload):
+async def inventory_status(payload: InventoryStatusPayload, request: Request):
     if not payload.ids:
         raise HTTPException(400, "no ids")
     try:
-        return db.update_inventory_status(payload.ids, payload.action, payload.reason)
+        result = db.update_inventory_status(payload.ids, payload.action, payload.reason)
+        _audit_request(
+            request,
+            action=f"inventory_{payload.action}",
+            target_type="inventory",
+            metadata={
+                "requested": len(payload.ids),
+                "updated": result.get("updated", 0),
+                "skipped": result.get("skipped", 0),
+            },
+        )
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -451,16 +718,88 @@ async def inventory_meta(inventory_id: int, payload: InventoryMetaPayload):
 
 
 @app.post("/api/inventory/export", dependencies=[Depends(require_auth)])
-async def inventory_export(payload: InventoryExportPayload):
+async def inventory_export(payload: InventoryExportPayload, request: Request):
     if not payload.ids:
         raise HTTPException(400, "no ids")
     rows = db.export_inventory_entries(payload.ids)
+    _audit_request(
+        request,
+        action="full_key_export",
+        target_type="inventory",
+        metadata={"count": len(rows), "format": payload.format},
+    )
     if payload.format == "json":
         return JSONResponse([_safe_inventory_row(dict(r), include_full_key=True) for r in rows])
-    if payload.format != "txt":
-        raise HTTPException(400, "unsupported format")
-    body = "\n".join(r["api_key"] for r in rows)
-    return PlainTextResponse(body)
+    return _secret_export_response(rows, payload.format)
+
+
+@app.post("/api/inventory/sell", dependencies=[Depends(require_auth)])
+async def inventory_sell(payload: InventorySalePayload, request: Request):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    buyer = payload.buyer.strip()
+    if not buyer:
+        raise HTTPException(400, "buyer required")
+    if len(buyer) > 200:
+        raise HTTPException(400, "buyer is too long")
+    if payload.external_ref and len(payload.external_ref.strip()) > 200:
+        raise HTTPException(400, "external_ref is too long")
+    if payload.note and len(payload.note.strip()) > 2000:
+        raise HTTPException(400, "note is too long")
+    try:
+        result = db.sell_inventory(
+            payload.ids,
+            buyer=buyer,
+            unit_price_minor=_unit_price_to_minor(payload.unit_price),
+            currency=payload.currency,
+            external_ref=(payload.external_ref or "").strip() or None,
+            note=(payload.note or "").strip() or None,
+        )
+    except db.InventoryConflictError as exc:
+        raise HTTPException(409, str(exc))
+    _audit_request(
+        request,
+        action="inventory_sell",
+        target_type="inventory",
+        metadata={"count": result.get("sold", 0), "sale_ids": result.get("sale_ids", [])},
+    )
+    return result
+
+
+@app.post("/api/inventory/return", dependencies=[Depends(require_auth)])
+async def inventory_return(payload: InventoryReturnPayload, request: Request):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(400, "reason required")
+    if len(reason) > 1000:
+        raise HTTPException(400, "reason is too long")
+    try:
+        result = db.return_inventory(payload.ids, reason=reason)
+    except db.InventoryConflictError as exc:
+        raise HTTPException(409, str(exc))
+    _audit_request(
+        request,
+        action="inventory_return",
+        target_type="inventory",
+        metadata={"count": result.get("returned", 0), "sale_ids": result.get("sale_ids", [])},
+    )
+    return result
+
+
+@app.post("/api/sales/export", dependencies=[Depends(require_auth)])
+async def sales_export(payload: InventoryExportPayload, request: Request):
+    if not payload.ids:
+        raise HTTPException(400, "no ids")
+    rows = db.export_sold_entries(payload.ids)
+    _audit_request(
+        request,
+        action="full_key_export",
+        target_type="sales",
+        metadata={"count": len(rows), "format": payload.format},
+    )
+    return _secret_export_response(rows, payload.format)
 
 
 # ────────────────────────────────────────────────────────────────────

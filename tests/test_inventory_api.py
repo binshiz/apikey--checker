@@ -64,6 +64,13 @@ class InventoryAPITests(unittest.TestCase):
     def test_vault_inbound_and_inventory_are_key_safe(self):
         vault = self.create_valid_vault_entry()
 
+        vault_before = self.client.get("/api/vault", headers=self.headers)
+        self.assertEqual(vault_before.status_code, 200)
+        vault_before_row = vault_before.json()["keys"][0]
+        self.assertNotIn("api_key", vault_before_row)
+        self.assertEqual(vault_before_row["is_in_inventory"], 0)
+        self.assertIsNone(vault_before_row["inventory_id"])
+
         inbound = self.client.post(
             "/api/vault/inbound",
             headers=self.headers,
@@ -80,6 +87,11 @@ class InventoryAPITests(unittest.TestCase):
         self.assertEqual(inbound_body["inbounded"], 1)
         self.assertEqual(inbound_body["skipped"], 0)
         self.assertIn("入库批次 ", inbound_body["batch"]["name"])
+
+        vault_after = self.client.get("/api/vault", headers=self.headers).json()["keys"][0]
+        self.assertEqual(vault_after["is_in_inventory"], 1)
+        self.assertIsNotNone(vault_after["inventory_id"])
+        self.assertEqual(vault_after["inventory_status"], "in_stock")
 
         inventory = self.client.get("/api/inventory", headers=self.headers)
         self.assertEqual(inventory.status_code, 200)

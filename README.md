@@ -1,6 +1,6 @@
 # API Key Tier Detector
 
-A web tool that batch-checks OpenAI / Anthropic / Gemini API keys, auto-detects the provider from key format, probes for usability and tier, and stores results in SQLite.
+A web tool that batch-checks OpenAI / Anthropic / Gemini / AWS Bedrock credentials, auto-detects the provider from key format, probes for usability and capabilities, and stores results in SQLite.
 
 ## Direction
 
@@ -8,13 +8,15 @@ This project is evolving from a detector into a lightweight API key inventory sy
 
 ## Features
 
-- **Auto-detect provider** from key string (`sk-proj-…`, `sk-ant-…`, `AIza…`).
+- **Auto-detect provider** from key string (`sk-proj-…`, `sk-ant-…`, `AIza…`, `AKIA…|SecretAccessKey`).
+- **AWS Bedrock**: validates long-term AWS credentials, proves Claude Opus access with a minimal `Converse` call, and offers an explicit multi-region deep check for model and quota details.
 - **OpenAI**: tier inferred from `x-ratelimit-limit-tokens` header; additionally probes access to `gpt-image-2` and `sora-2`.
-- **Gemini**: burst-tests `gemini-2.5-pro` until the first `429` — records measured RPM and maps to T1/T2/T3 (per user spec: <300 → T1, 300–1300 → T2, >1300 → T3).
+- **Gemini**: reads every page of model metadata, distinguishes callable capabilities via `supportedGenerationMethods`, then burst-tests `gemini-2.5-pro` (with Flash fallback) until the first `429` — records measured RPM and maps to T1/T2/T3 (per user spec: <300 → T1, 300–1300 → T2, >1300 → T3).
 - **Anthropic**: reads `anthropic-ratelimit-requests-limit` header when present, lists `/v1/models` for target model availability, otherwise burst-tests `claude-haiku-4-5`.
 - **Batch processing** with configurable concurrency, background job tracking, live progress bar.
 - **Bulk operations** in the UI: filter, multi-select, bulk copy, bulk re-test, bulk delete, single re-test.
 - **SQLite** storage of all results with provider/status/tier indexes.
+- **Inventory sales state** with auditable per-key sell/return records, buyer text, unit price, and append-only stock movements.
 
 ## Run
 

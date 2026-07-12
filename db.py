@@ -2,12 +2,21 @@
 import sqlite3
 import os
 import json
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterable, Callable
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "keys.db")
+
+
+class InventoryConflictError(ValueError):
+    """Raised when an atomic inventory sale/return cannot be applied."""
+
+    def __init__(self, message: str, *, conflicts: dict[int, str] | None = None):
+        super().__init__(message)
+        self.conflicts = conflicts or {}
 
 
 def init_db():
@@ -83,17 +92,22 @@ Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 def _run_migrations(c: sqlite3.Connection):
     migrations: list[Migration] = [
         (1, "inventory_foundation", _migration_inventory_foundation),
+        (2, "inventory_sales_and_check_state", _migration_inventory_sales_v2),
     ]
     for version, name, fn in migrations:
         row = c.execute(
             "SELECT version FROM schema_migrations WHERE version=?",
             (version,),
         ).fetchone()
-        if row:
+        if row and version != 2:
             continue
+        # v2 is deliberately reconciled on every startup.  Every operation in
+        # the migration is idempotent, so a database left with only some of
+        # the new columns/tables (including one with a prematurely inserted
+        # migration marker) heals itself on the next init_db().
         fn(c)
         c.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
             (version, name, now()),
         )
 
@@ -101,6 +115,255 @@ def _run_migrations(c: sqlite3.Connection):
 def _migration_inventory_foundation(c: sqlite3.Connection):
     _create_inventory_schema(c)
     _backfill_inventory_from_legacy(c)
+
+
+def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(
+    c: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+):
+    if column not in _table_columns(c, table):
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+_SOCKS_PROXY_URL = re.compile(r"\bsocks5h?://[^\s\"']+", re.IGNORECASE)
+_CREDENTIAL_URL = re.compile(
+    r"\b(?:https?|socks5h?)://[^\s/@:\"']+:[^\s/@\"']+@[^\s\"']+",
+    re.IGNORECASE,
+)
+_PROXY_EXTRA_KEYS = {"proxy", "proxy_url", "proxy_uri"}
+
+
+def _redact_proxy_urls(value: str | None) -> str | None:
+    if value is None:
+        return None
+    redacted = _CREDENTIAL_URL.sub("[proxy redacted]", str(value))
+    return _SOCKS_PROXY_URL.sub("[proxy redacted]", redacted)
+
+
+def _sanitize_check_extra(value):
+    """Remove proxy locations from provider results before persistence."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_name = str(key)
+            lowered = key_name.lower()
+            if lowered in _PROXY_EXTRA_KEYS:
+                continue
+            if lowered == "proxy_dead" and isinstance(item, str):
+                sanitized[key_name] = True
+                continue
+            sanitized[key_name] = _sanitize_check_extra(item)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_check_extra(item) for item in value]
+    if isinstance(value, str):
+        return _redact_proxy_urls(value)
+    return value
+
+
+def _scrub_persisted_proxy_data(c: sqlite3.Connection):
+    """Idempotently remove legacy proxy endpoints without exposing row data."""
+    proxy_field_pattern = re.compile(r'"(?:proxy|proxy_url|proxy_uri|proxy_dead)"\s*:', re.I)
+    for table in ("keys", "vault", "api_key_inventory", "check_runs"):
+        columns = _table_columns(c, table)
+        if "extra" not in columns:
+            continue
+        select_columns = "id, extra" + (", error" if "error" in columns else "")
+        where_clause = (
+            "extra IS NOT NULL OR error IS NOT NULL"
+            if "error" in columns
+            else "extra IS NOT NULL"
+        )
+        rows = c.execute(
+            f"SELECT {select_columns} FROM {table} WHERE {where_clause}"
+        ).fetchall()
+        for row in rows:
+            raw_extra = row["extra"]
+            if raw_extra is not None:
+                try:
+                    parsed = json.loads(raw_extra)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    clean_extra = _redact_proxy_urls(str(raw_extra))
+                    if proxy_field_pattern.search(clean_extra or ""):
+                        clean_extra = "{}"
+                else:
+                    clean_extra = json.dumps(
+                        _sanitize_check_extra(parsed),
+                        ensure_ascii=False,
+                    )
+                if clean_extra != raw_extra:
+                    c.execute(
+                        f"UPDATE {table} SET extra=? WHERE id=?",
+                        (clean_extra, row["id"]),
+                    )
+
+            if "error" in columns and row["error"] is not None:
+                clean_error = _redact_proxy_urls(row["error"])
+                if clean_error != row["error"]:
+                    c.execute(
+                        f"UPDATE {table} SET error=? WHERE id=?",
+                        (clean_error, row["id"]),
+                    )
+    c.execute("UPDATE check_runs SET proxy=NULL WHERE proxy IS NOT NULL")
+
+
+def _stock_movements_has_sale_fk(c: sqlite3.Connection) -> bool:
+    return any(
+        row["from"] == "sale_id"
+        and row["table"] == "sales"
+        and row["to"] == "id"
+        and row["on_delete"].upper() == "SET NULL"
+        for row in c.execute("PRAGMA foreign_key_list(stock_movements)").fetchall()
+    )
+
+
+def _rebuild_stock_movements_with_sale_fk(c: sqlite3.Connection):
+    """Repair databases created with the early v2 sale_id column lacking an FK."""
+    c.execute("DROP TABLE IF EXISTS stock_movements_v2_rebuild")
+    c.execute("""
+        CREATE TABLE stock_movements_v2_rebuild (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            inventory_id   INTEGER NOT NULL REFERENCES api_key_inventory(id),
+            movement_type  TEXT NOT NULL,
+            from_status    TEXT,
+            to_status      TEXT,
+            quantity       INTEGER NOT NULL DEFAULT 1,
+            reason         TEXT,
+            metadata       TEXT,
+            created_at     INTEGER NOT NULL,
+            sale_id        INTEGER REFERENCES sales(id) ON DELETE SET NULL
+        )
+    """)
+    c.execute("""
+        INSERT INTO stock_movements_v2_rebuild (
+            id, inventory_id, movement_type, from_status, to_status,
+            quantity, reason, metadata, created_at, sale_id
+        )
+        SELECT sm.id, sm.inventory_id, sm.movement_type, sm.from_status,
+               sm.to_status, sm.quantity, sm.reason, sm.metadata, sm.created_at,
+               CASE
+                   WHEN sm.sale_id IS NULL
+                     OR EXISTS (SELECT 1 FROM sales s WHERE s.id=sm.sale_id)
+                   THEN sm.sale_id
+                   ELSE NULL
+               END
+          FROM stock_movements sm
+         ORDER BY sm.id
+    """)
+    c.execute("DROP TABLE stock_movements")
+    c.execute("ALTER TABLE stock_movements_v2_rebuild RENAME TO stock_movements")
+    c.execute("CREATE INDEX idx_movements_inventory ON stock_movements(inventory_id)")
+    c.execute("CREATE INDEX idx_movements_type ON stock_movements(movement_type)")
+    c.execute("CREATE INDEX idx_movements_created ON stock_movements(created_at)")
+
+
+def _migration_inventory_sales_v2(c: sqlite3.Connection):
+    # Create the independent tables first so the movement FK can reference
+    # sales even when recovering a partially-applied migration.
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS sales (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        inventory_id       INTEGER NOT NULL REFERENCES api_key_inventory(id),
+        buyer              TEXT NOT NULL,
+        unit_price_minor   INTEGER CHECK(unit_price_minor IS NULL OR unit_price_minor >= 0),
+        currency           TEXT NOT NULL DEFAULT 'CNY',
+        external_ref       TEXT,
+        note               TEXT,
+        status             TEXT NOT NULL DEFAULT 'sold' CHECK(status IN ('sold', 'returned')),
+        sold_at            INTEGER NOT NULL,
+        returned_at        INTEGER,
+        return_reason      TEXT,
+        created_at         INTEGER NOT NULL,
+        updated_at         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sales_inventory ON sales(inventory_id);
+    CREATE INDEX IF NOT EXISTS idx_sales_status ON sales(status);
+    CREATE INDEX IF NOT EXISTS idx_sales_sold_at ON sales(sold_at);
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor        TEXT NOT NULL DEFAULT 'admin',
+        ip_address   TEXT,
+        action       TEXT NOT NULL,
+        target_type  TEXT NOT NULL,
+        target_id    INTEGER,
+        metadata     TEXT NOT NULL DEFAULT '{}',
+        created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_logs(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+    """)
+
+    _add_column_if_missing(
+        c,
+        "api_key_inventory",
+        "current_check_status",
+        "TEXT NOT NULL DEFAULT 'pending'",
+    )
+    _add_column_if_missing(
+        c,
+        "stock_movements",
+        "sale_id",
+        "INTEGER REFERENCES sales(id) ON DELETE SET NULL",
+    )
+    if not _stock_movements_has_sale_fk(c):
+        _rebuild_stock_movements_with_sale_fk(c)
+    _add_column_if_missing(
+        c,
+        "jobs",
+        "mode",
+        "TEXT NOT NULL DEFAULT 'quick'",
+    )
+
+    # Use the persisted latest run as source of truth.  The legacy keys row is
+    # the fallback for inventories whose v1 backfill had no check run.
+    c.execute("""
+        UPDATE api_key_inventory
+           SET current_check_status = COALESCE(
+               (SELECT cr.status
+                  FROM check_runs cr
+                 WHERE cr.id = api_key_inventory.latest_check_run_id),
+               (SELECT k.status
+                  FROM keys k
+                 WHERE k.id = api_key_inventory.key_id),
+               CASE stock_status
+                   WHEN 'in_stock' THEN 'valid'
+                   WHEN 'no_quota' THEN 'no_quota'
+                   WHEN 'invalid' THEN 'invalid'
+                   ELSE 'pending'
+               END
+           )
+         WHERE current_check_status IS NULL
+            OR current_check_status = ''
+            OR (
+                current_check_status = 'pending'
+                AND stock_status != 'returned'
+                AND latest_check_run_id IS NOT NULL
+                AND COALESCE(
+                    (SELECT k.status
+                       FROM keys k
+                      WHERE k.id = api_key_inventory.key_id),
+                    ''
+                ) NOT IN ('pending', 'checking')
+            )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inventory_check_status "
+        "ON api_key_inventory(current_check_status)"
+    )
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_one_active_sold
+        ON sales(inventory_id)
+        WHERE status='sold'
+    """)
+    _scrub_persisted_proxy_data(c)
 
 
 def _create_inventory_schema(c: sqlite3.Connection):
@@ -141,6 +404,7 @@ def _create_inventory_schema(c: sqlite3.Connection):
         batch_id              INTEGER REFERENCES purchase_batches(id) ON DELETE SET NULL,
         provider              TEXT,
         stock_status          TEXT NOT NULL DEFAULT 'pending_check',
+        current_check_status  TEXT NOT NULL DEFAULT 'pending',
         tier                  TEXT,
         rpm                   INTEGER,
         tpm                   INTEGER,
@@ -212,6 +476,7 @@ def _backfill_inventory_from_legacy(c: sqlite3.Connection):
             provider=row["provider"],
             key_id=row["id"],
             stock_status=stock_status,
+            current_check_status=row["status"],
             tier=row["tier"],
             rpm=row["rpm"],
             tpm=row["tpm"],
@@ -274,6 +539,7 @@ def _backfill_inventory_from_legacy(c: sqlite3.Connection):
             provider=row["provider"],
             vault_id=row["id"],
             stock_status="pending_check",
+            current_check_status="valid",
             tier=row["tier"],
             rpm=row["rpm"],
             tpm=row["tpm"],
@@ -345,6 +611,104 @@ def _json_dumps(value) -> str:
     return json.dumps(value or {}, ensure_ascii=False)
 
 
+_SENSITIVE_METADATA_FIELD = re.compile(
+    r"(^|_)(api_?key|secret|credential|password|token)(_|$)",
+    re.IGNORECASE,
+)
+_AWS_ACCESS_ID = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_AWS_CREDENTIAL_PAIR = re.compile(
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\s*\|\s*[A-Za-z0-9/+=]{40,}(?=$|\s|[,;}])"
+)
+_COMMON_API_KEY = re.compile(
+    r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})\b"
+)
+
+
+def _sanitize_metadata(value):
+    """Return JSON-safe metadata with credentials removed.
+
+    Audit and movement metadata is intentionally descriptive, never a secret
+    transport.  Sensitive field names are redacted recursively and AWS access
+    IDs embedded in free text are masked as a final guardrail.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[REDACTED]"
+                if _SENSITIVE_METADATA_FIELD.search(str(key))
+                else _sanitize_metadata(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_metadata(item) for item in value]
+    if isinstance(value, str):
+        value = _AWS_CREDENTIAL_PAIR.sub("[REDACTED_AWS_CREDENTIAL]", value)
+        value = _AWS_ACCESS_ID.sub("AWS_ACCESS_KEY_REDACTED", value)
+        return _COMMON_API_KEY.sub("[REDACTED_API_KEY]", value)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return str(value)
+
+
+def _metadata_dumps(value: dict | None) -> str:
+    return json.dumps(_sanitize_metadata(value or {}), ensure_ascii=False)
+
+
+def _insert_audit_conn(
+    c: sqlite3.Connection,
+    *,
+    action: str,
+    target_type: str,
+    target_id: int | None = None,
+    metadata: dict | None = None,
+    actor: str = "admin",
+    ip_address: str | None = None,
+    created_at: int | None = None,
+) -> int:
+    clean_action = (action or "").strip()
+    clean_target_type = (target_type or "").strip()
+    if not clean_action:
+        raise ValueError("audit action is required")
+    if not clean_target_type:
+        raise ValueError("audit target_type is required")
+    cur = c.execute(
+        """INSERT INTO audit_logs (
+               actor, ip_address, action, target_type, target_id, metadata, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (actor or "admin").strip() or "admin",
+            (ip_address or "").strip() or None,
+            clean_action,
+            clean_target_type,
+            target_id,
+            _metadata_dumps(metadata),
+            created_at or now(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def record_audit(
+    action: str,
+    target_type: str,
+    target_id: int | None = None,
+    metadata: dict | None = None,
+    actor: str = "admin",
+    ip_address: str | None = None,
+) -> int:
+    with conn() as c:
+        return _insert_audit_conn(
+            c,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            metadata=metadata,
+            actor=actor,
+            ip_address=ip_address,
+        )
+
+
 def _ensure_inventory_conn(
     c: sqlite3.Connection,
     *,
@@ -355,6 +719,7 @@ def _ensure_inventory_conn(
     supplier_id: int | None = None,
     batch_id: int | None = None,
     stock_status: str = "pending_check",
+    current_check_status: str = "pending",
     tier: str | None = None,
     rpm: int | None = None,
     tpm: int | None = None,
@@ -382,6 +747,7 @@ def _ensure_inventory_conn(
                 batch_id=COALESCE(batch_id, ?),
                 provider=COALESCE(?, provider),
                 stock_status=?,
+                current_check_status=?,
                 tier=CASE WHEN ? THEN ? ELSE tier END,
                 rpm=CASE WHEN ? THEN ? ELSE rpm END,
                 tpm=CASE WHEN ? THEN ? ELSE tpm END,
@@ -399,6 +765,7 @@ def _ensure_inventory_conn(
                 batch_id,
                 provider,
                 stock_status,
+                current_check_status,
                 1 if overwrite_result_fields else 0,
                 tier,
                 1 if overwrite_result_fields else 0,
@@ -421,9 +788,9 @@ def _ensure_inventory_conn(
     cur = c.execute(
         """INSERT INTO api_key_inventory (
             api_key, key_id, vault_id, supplier_id, batch_id, provider,
-            stock_status, tier, rpm, tpm, extra, error, note, tags,
+            stock_status, current_check_status, tier, rpm, tpm, extra, error, note, tags,
             first_seen_at, last_checked_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             api_key,
             key_id,
@@ -432,6 +799,7 @@ def _ensure_inventory_conn(
             batch_id,
             provider,
             stock_status,
+            current_check_status,
             tier,
             rpm,
             tpm,
@@ -468,20 +836,39 @@ def _insert_stock_movement_conn(
     reason: str | None,
     metadata: dict | None,
     created_at: int,
+    sale_id: int | None = None,
 ):
+    if "sale_id" not in _table_columns(c, "stock_movements"):
+        c.execute(
+            """INSERT INTO stock_movements (
+                inventory_id, movement_type, from_status, to_status, quantity,
+                reason, metadata, created_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+            (
+                inventory_id,
+                movement_type,
+                from_status,
+                to_status,
+                reason,
+                _metadata_dumps(metadata),
+                created_at,
+            ),
+        )
+        return
     c.execute(
         """INSERT INTO stock_movements (
             inventory_id, movement_type, from_status, to_status, quantity,
-            reason, metadata, created_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+            reason, metadata, created_at, sale_id
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)""",
         (
             inventory_id,
             movement_type,
             from_status,
             to_status,
             reason,
-            _json_dumps(metadata),
+            _metadata_dumps(metadata),
             created_at,
+            sale_id,
         ),
     )
 
@@ -585,6 +972,15 @@ def upsert_keys(keys: Iterable[str], providers: dict[str, str | None]) -> list[i
                        WHERE id=?""",
                     (prov, t, row["id"]),
                 )
+                c.execute(
+                    """UPDATE api_key_inventory
+                       SET key_id=COALESCE(key_id, ?),
+                           provider=COALESCE(provider, ?),
+                           current_check_status='pending',
+                           updated_at=?
+                       WHERE api_key=?""",
+                    (row["id"], prov, t, k),
+                )
                 ids.append(row["id"])
                 continue
 
@@ -600,6 +996,7 @@ def upsert_keys(keys: Iterable[str], providers: dict[str, str | None]) -> list[i
                 provider=prov,
                 key_id=key_id,
                 stock_status="pending_check",
+                current_check_status="pending",
                 first_seen_at=t,
                 updated_at=t,
             )
@@ -624,47 +1021,40 @@ def set_key_status(key_id: int, status: str):
         row = c.execute("SELECT api_key, provider FROM keys WHERE id=?", (key_id,)).fetchone()
         if not row:
             return
-        new_stock_status = _stock_status_from_check_status(status)
         current = c.execute(
-            "SELECT id, stock_status FROM api_key_inventory WHERE api_key=?",
+            "SELECT id FROM api_key_inventory WHERE api_key=?",
             (row["api_key"],),
         ).fetchone()
-        inventory_id, created = _ensure_inventory_conn(
-            c,
-            api_key=row["api_key"],
-            provider=row["provider"],
-            key_id=key_id,
-            stock_status=new_stock_status,
-            updated_at=t,
-            overwrite_result_fields=False,
-        )
-        if created:
-            _insert_stock_movement_conn(
-                c,
-                inventory_id,
-                "status_update",
-                None,
-                new_stock_status,
-                status,
-                {"key_id": key_id},
-                t,
+        if current:
+            c.execute(
+                """UPDATE api_key_inventory
+                   SET key_id=COALESCE(key_id, ?),
+                       provider=COALESCE(provider, ?),
+                       current_check_status=?,
+                       updated_at=?
+                   WHERE id=?""",
+                (key_id, row["provider"], status, t, current["id"]),
             )
-        elif current:
-            _insert_movement_if_status_changed_conn(
+        else:
+            _ensure_inventory_conn(
                 c,
-                inventory_id,
-                "status_update",
-                current["stock_status"],
-                new_stock_status,
-                status,
-                {"key_id": key_id},
-                t,
+                api_key=row["api_key"],
+                provider=row["provider"],
+                key_id=key_id,
+                stock_status="pending_check",
+                current_check_status=status,
+                updated_at=t,
+                overwrite_result_fields=False,
             )
 
 
-def save_result(key_id: int, result: dict):
+def save_result(key_id: int, result: dict, source: str = "checker"):
     t = now()
-    extra_json = json.dumps(result.get("extra") or {}, ensure_ascii=False)
+    extra_json = json.dumps(
+        _sanitize_check_extra(result.get("extra") or {}),
+        ensure_ascii=False,
+    )
+    clean_error = _redact_proxy_urls(result.get("error"))
     status = result.get("status", "error")
     with conn() as c:
         c.execute(
@@ -678,7 +1068,7 @@ def save_result(key_id: int, result: dict):
                 result.get("rpm"),
                 result.get("tpm"),
                 extra_json,
-                result.get("error"),
+                clean_error,
                 t, t, key_id,
             ),
         )
@@ -691,18 +1081,26 @@ def save_result(key_id: int, result: dict):
             (row["api_key"],),
         ).fetchone()
         is_formal_inventory = bool(current and current["supplier_id"] and current["batch_id"])
-        stock_status = _stock_status_from_check_status(status, is_formal_inventory=is_formal_inventory)
+        protected_statuses = {"reserved", "sold", "returned", "quarantined", "archived"}
+        if current and current["stock_status"] in protected_statuses:
+            stock_status = current["stock_status"]
+        else:
+            stock_status = _stock_status_from_check_status(
+                status,
+                is_formal_inventory=is_formal_inventory,
+            )
         inventory_id, created = _ensure_inventory_conn(
             c,
             api_key=row["api_key"],
             provider=row["provider"],
             key_id=key_id,
             stock_status=stock_status,
+            current_check_status=status,
             tier=result.get("tier"),
             rpm=result.get("rpm"),
             tpm=result.get("tpm"),
             extra=extra_json,
-            error=result.get("error"),
+            error=clean_error,
             last_checked_at=t,
             updated_at=t,
         )
@@ -717,9 +1115,9 @@ def save_result(key_id: int, result: dict):
             rpm=result.get("rpm"),
             tpm=result.get("tpm"),
             extra=extra_json,
-            error=result.get("error"),
-            proxy=(result.get("extra") or {}).get("proxy"),
-            source="checker",
+            error=clean_error,
+            proxy=None,
+            source=source or "checker",
             checked_at=t,
             created_at=t,
         )
@@ -767,16 +1165,41 @@ def _vault_upsert_conn(c, api_key, provider, tier, rpm, tpm, extra_json, t) -> i
     return cur.lastrowid
 
 
-def list_vault(provider: str | None = None, tier: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM vault WHERE 1=1"
+def list_vault(
+    provider: str | None = None,
+    tier: str | None = None,
+    legacy_sale_candidate: bool = False,
+) -> list[dict]:
+    sql = """SELECT v.*,
+                    CASE WHEN instr(COALESCE(v.note, ''), '售出') > 0 THEN 1 ELSE 0 END
+                        AS legacy_sale_candidate,
+                    CASE
+                        WHEN i.supplier_id IS NOT NULL AND i.batch_id IS NOT NULL THEN 1
+                        ELSE 0
+                     END AS is_in_inventory,
+                    CASE
+                        WHEN i.supplier_id IS NOT NULL AND i.batch_id IS NOT NULL
+                        THEN i.id
+                        ELSE NULL
+                     END AS inventory_id,
+                    CASE
+                        WHEN i.supplier_id IS NOT NULL AND i.batch_id IS NOT NULL
+                        THEN i.stock_status
+                        ELSE NULL
+                     END AS inventory_status
+             FROM vault v
+             LEFT JOIN api_key_inventory i ON i.api_key = v.api_key
+             WHERE 1=1"""
     args = []
     if provider:
-        sql += " AND provider=?"
+        sql += " AND v.provider=?"
         args.append(provider)
     if tier:
-        sql += " AND tier=?"
+        sql += " AND v.tier=?"
         args.append(tier)
-    sql += " ORDER BY last_verified_at DESC"
+    if legacy_sale_candidate:
+        sql += " AND instr(COALESCE(v.note, ''), '售出') > 0"
+    sql += " ORDER BY v.last_verified_at DESC"
     with conn() as c:
         rows = c.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
@@ -797,6 +1220,13 @@ def delete_vault(ids: list[int]) -> int:
     placeholders = ",".join("?" for _ in ids)
     with conn() as c:
         cur = c.execute(f"DELETE FROM vault WHERE id IN ({placeholders})", ids)
+        if cur.rowcount:
+            _insert_audit_conn(
+                c,
+                action="vault_delete",
+                target_type="vault",
+                metadata={"requested_ids": _unique_ids(ids), "deleted": cur.rowcount},
+            )
         return cur.rowcount
 
 
@@ -813,7 +1243,16 @@ def vault_stats() -> dict:
             "SELECT provider, COUNT(*) FROM vault GROUP BY provider").fetchall()}
         by_tier = {r[0] or "?": r[1] for r in c.execute(
             "SELECT tier, COUNT(*) FROM vault GROUP BY tier").fetchall()}
-    return {"total": total, "by_provider": by_prov, "by_tier": by_tier}
+        legacy_sale_candidates = c.execute(
+            """SELECT COUNT(*) FROM vault
+               WHERE instr(COALESCE(note, ''), '售出') > 0"""
+        ).fetchone()[0]
+    return {
+        "total": total,
+        "by_provider": by_prov,
+        "by_tier": by_tier,
+        "legacy_sale_candidates": legacy_sale_candidates,
+    }
 
 
 def upsert_supplier(name: str) -> int:
@@ -925,7 +1364,17 @@ def inbound_from_vault(
             if inventory and inventory["supplier_id"] and inventory["batch_id"]:
                 skipped += 1
                 continue
-            inbound_rows.append((row, inventory))
+            # The vault records the last known valid snapshot, but the keys
+            # table is the source of truth for the current check state.  A key
+            # may have become invalid/no-quota after it entered the vault, so
+            # formal inbound must never revive it as sellable from stale vault
+            # data.  Vault-only legacy rows require a fresh check first.
+            key_state = c.execute(
+                """SELECT id, provider, status, tier, rpm, tpm, extra, error, checked_at
+                   FROM keys WHERE api_key=?""",
+                (row["api_key"],),
+            ).fetchone()
+            inbound_rows.append((row, inventory, key_state))
 
         if not inbound_rows:
             return {"inbounded": 0, "skipped": skipped, "batch": None}
@@ -934,7 +1383,7 @@ def inbound_from_vault(
         batch = _create_inbound_batch_conn(
             c,
             supplier_id=supplier_id,
-            quantity=len(rows),
+            quantity=len(inbound_rows),
             total_cost=total_cost,
             tags=tags,
             note=note,
@@ -942,23 +1391,31 @@ def inbound_from_vault(
         )
 
         inbounded = 0
-        for row, inventory in inbound_rows:
+        for row, inventory, key_state in inbound_rows:
+            check_status = key_state["status"] if key_state else "pending"
+            stock_status = _stock_status_from_check_status(
+                check_status,
+                is_formal_inventory=True,
+            )
             inventory_id, created = _ensure_inventory_conn(
                 c,
                 api_key=row["api_key"],
-                provider=row["provider"],
+                provider=(key_state["provider"] if key_state else None) or row["provider"],
+                key_id=key_state["id"] if key_state else None,
                 vault_id=row["id"],
                 supplier_id=supplier_id,
                 batch_id=batch["id"],
-                stock_status="in_stock",
-                tier=row["tier"],
-                rpm=row["rpm"],
-                tpm=row["tpm"],
-                extra=row["extra"],
+                stock_status=stock_status,
+                current_check_status=check_status,
+                tier=key_state["tier"] if key_state else row["tier"],
+                rpm=key_state["rpm"] if key_state else row["rpm"],
+                tpm=key_state["tpm"] if key_state else row["tpm"],
+                extra=key_state["extra"] if key_state else row["extra"],
+                error=key_state["error"] if key_state else None,
                 note=note or row["note"],
                 tags=tags,
                 first_seen_at=row["first_verified_at"],
-                last_checked_at=row["last_verified_at"],
+                last_checked_at=(key_state["checked_at"] if key_state else None),
                 updated_at=t,
             )
             from_status = None if created else (inventory["stock_status"] if inventory and "stock_status" in inventory.keys() else None)
@@ -967,12 +1424,30 @@ def inbound_from_vault(
                 inventory_id,
                 "inbound_from_vault",
                 from_status,
-                "in_stock",
+                stock_status,
                 "vault_selected_inbound",
-                {"vault_id": row["id"], "batch_id": batch["id"], "supplier_id": supplier_id},
+                {
+                    "vault_id": row["id"],
+                    "batch_id": batch["id"],
+                    "supplier_id": supplier_id,
+                    "current_check_status": check_status,
+                },
                 t,
             )
             inbounded += 1
+
+        _insert_audit_conn(
+            c,
+            action="inventory_inbound",
+            target_type="purchase_batch",
+            target_id=batch["id"],
+            metadata={
+                "supplier_id": supplier_id,
+                "quantity": inbounded,
+                "skipped": skipped,
+            },
+            created_at=t,
+        )
 
         return {"inbounded": inbounded, "skipped": skipped, "batch": batch}
 
@@ -984,6 +1459,7 @@ def list_inventory(
     supplier_id: int | None = None,
     batch_id: int | None = None,
     risk_flag: str | None = None,
+    sale_view: str = "all",
 ) -> list[dict]:
     sql = """
         SELECT
@@ -1000,15 +1476,36 @@ def list_inventory(
                 THEN b.total_cost / b.quantity
                 ELSE NULL
             END AS unit_cost,
-            cr.status AS latest_check_status,
-            cr.checked_at AS latest_check_at
+            i.current_check_status AS latest_check_status,
+            cr.checked_at AS latest_check_at,
+            sl.id AS sale_id,
+            sl.status AS sale_status,
+            sl.buyer AS buyer,
+            sl.unit_price_minor AS unit_price_minor,
+            sl.currency AS currency,
+            sl.external_ref AS external_ref,
+            sl.sold_at AS sold_at,
+            sl.returned_at AS returned_at
         FROM api_key_inventory i
         JOIN suppliers s ON s.id = i.supplier_id
         JOIN purchase_batches b ON b.id = i.batch_id
         LEFT JOIN check_runs cr ON cr.id = i.latest_check_run_id
+        LEFT JOIN sales sl ON sl.id = (
+            SELECT s2.id FROM sales s2
+            WHERE s2.inventory_id = i.id
+            ORDER BY CASE WHEN s2.status='sold' THEN 0 ELSE 1 END,
+                     s2.sold_at DESC, s2.id DESC
+            LIMIT 1
+        )
         WHERE i.supplier_id IS NOT NULL AND i.batch_id IS NOT NULL
     """
     args = []
+    if sale_view not in ("all", "sellable", "sold"):
+        raise ValueError("sale_view must be 'all', 'sellable', or 'sold'")
+    if sale_view == "sellable":
+        sql += " AND i.stock_status='in_stock' AND i.current_check_status='valid'"
+    elif sale_view == "sold":
+        sql += " AND i.stock_status='sold'"
     if provider:
         sql += " AND i.provider=?"
         args.append(provider)
@@ -1052,12 +1549,27 @@ def _formal_inventory_select_sql() -> str:
                 THEN b.total_cost / b.quantity
                 ELSE NULL
             END AS unit_cost,
-            cr.status AS latest_check_status,
-            cr.checked_at AS latest_check_at
+            i.current_check_status AS latest_check_status,
+            cr.checked_at AS latest_check_at,
+            sl.id AS sale_id,
+            sl.status AS sale_status,
+            sl.buyer AS buyer,
+            sl.unit_price_minor AS unit_price_minor,
+            sl.currency AS currency,
+            sl.external_ref AS external_ref,
+            sl.sold_at AS sold_at,
+            sl.returned_at AS returned_at
         FROM api_key_inventory i
         JOIN suppliers s ON s.id = i.supplier_id
         JOIN purchase_batches b ON b.id = i.batch_id
         LEFT JOIN check_runs cr ON cr.id = i.latest_check_run_id
+        LEFT JOIN sales sl ON sl.id = (
+            SELECT s2.id FROM sales s2
+            WHERE s2.inventory_id = i.id
+            ORDER BY CASE WHEN s2.status='sold' THEN 0 ELSE 1 END,
+                     s2.sold_at DESC, s2.id DESC
+            LIMIT 1
+        )
     """
 
 
@@ -1082,17 +1594,27 @@ def get_inventory_detail(inventory_id: int) -> dict | None:
         ).fetchall()
         movements = c.execute(
             """SELECT id, movement_type, from_status, to_status, quantity,
-                      reason, metadata, created_at
+                      reason, metadata, created_at, sale_id
                FROM stock_movements
                WHERE inventory_id=?
                ORDER BY created_at DESC, id DESC
                LIMIT 50""",
             (inventory_id,),
         ).fetchall()
+        sales = c.execute(
+            """SELECT id, inventory_id, buyer, unit_price_minor, currency,
+                      external_ref, note, status, sold_at, returned_at,
+                      return_reason, created_at, updated_at
+               FROM sales
+               WHERE inventory_id=?
+               ORDER BY sold_at DESC, id DESC""",
+            (inventory_id,),
+        ).fetchall()
         return {
             "item": dict(row),
             "check_runs": [dict(r) for r in check_runs],
             "movements": [dict(r) for r in movements],
+            "sales": [dict(r) for r in sales],
         }
 
 
@@ -1143,10 +1665,11 @@ def _can_apply_inventory_action(row: sqlite3.Row, action: str, target_status: st
 
 
 def update_inventory_status(ids: list[int], action: str, reason: str | None = None) -> dict:
-    if not ids:
+    inventory_ids = _unique_ids(ids)
+    if not inventory_ids:
         return {"updated": 0, "skipped": 0}
     target_status = _target_status_for_inventory_action(action)
-    placeholders = ",".join("?" for _ in ids)
+    placeholders = ",".join("?" for _ in inventory_ids)
     t = now()
     updated = 0
     skipped = 0
@@ -1158,10 +1681,10 @@ def update_inventory_status(ids: list[int], action: str, reason: str | None = No
               AND i.batch_id IS NOT NULL
             ORDER BY i.id
             """,
-            ids,
+            inventory_ids,
         ).fetchall()
         by_id = {row["id"]: row for row in rows}
-        for inventory_id in ids:
+        for inventory_id in inventory_ids:
             row = by_id.get(inventory_id)
             if not row or not _can_apply_inventory_action(row, action, target_status):
                 skipped += 1
@@ -1180,8 +1703,218 @@ def update_inventory_status(ids: list[int], action: str, reason: str | None = No
                 {"action": action},
                 t,
             )
+            _insert_audit_conn(
+                c,
+                action=f"inventory_{action}",
+                target_type="inventory",
+                target_id=inventory_id,
+                metadata={"from_status": row["stock_status"], "to_status": target_status},
+                created_at=t,
+            )
             updated += 1
     return {"updated": updated, "skipped": skipped}
+
+
+def _unique_ids(ids: list[int]) -> list[int]:
+    return list(dict.fromkeys(int(item) for item in ids))
+
+
+def sell_inventory(
+    ids: list[int],
+    buyer: str,
+    unit_price_minor: int | None = None,
+    currency: str = "CNY",
+    external_ref: str | None = None,
+    note: str | None = None,
+) -> dict:
+    inventory_ids = _unique_ids(ids)
+    if not inventory_ids:
+        return {"sold": 0, "sale_ids": []}
+    clean_buyer = (buyer or "").strip()
+    if not clean_buyer:
+        raise ValueError("buyer is required")
+    if unit_price_minor is not None:
+        if isinstance(unit_price_minor, bool) or not isinstance(unit_price_minor, int):
+            raise ValueError("unit_price_minor must be an integer")
+        if unit_price_minor < 0:
+            raise ValueError("unit_price_minor must be non-negative")
+    clean_currency = (currency or "CNY").strip().upper()
+    if clean_currency != "CNY":
+        raise ValueError("currency must be CNY")
+    clean_external_ref = (external_ref or "").strip() or None
+    clean_note = (note or "").strip() or None
+    placeholders = ",".join("?" for _ in inventory_ids)
+    t = now()
+
+    try:
+        with conn() as c:
+            # Serialize the read/validate/write sequence across processes.
+            c.execute("BEGIN IMMEDIATE")
+            rows = c.execute(
+                f"""SELECT id, stock_status, current_check_status,
+                           supplier_id, batch_id
+                    FROM api_key_inventory
+                    WHERE id IN ({placeholders})""",
+                inventory_ids,
+            ).fetchall()
+            by_id = {row["id"]: row for row in rows}
+            conflicts: dict[int, str] = {}
+            for inventory_id in inventory_ids:
+                row = by_id.get(inventory_id)
+                if not row or not row["supplier_id"] or not row["batch_id"]:
+                    conflicts[inventory_id] = "not_formal_inventory"
+                elif row["stock_status"] not in ("in_stock", "reserved"):
+                    conflicts[inventory_id] = f"stock_status:{row['stock_status']}"
+                elif row["current_check_status"] != "valid":
+                    conflicts[inventory_id] = "latest_check_not_valid"
+            if conflicts:
+                raise InventoryConflictError(
+                    f"inventory sale conflict for {len(conflicts)} item(s)",
+                    conflicts=conflicts,
+                )
+
+            sale_ids: list[int] = []
+            for inventory_id in inventory_ids:
+                row = by_id[inventory_id]
+                cur = c.execute(
+                    """INSERT INTO sales (
+                           inventory_id, buyer, unit_price_minor, currency,
+                           external_ref, note, status, sold_at, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'sold', ?, ?, ?)""",
+                    (
+                        inventory_id,
+                        clean_buyer,
+                        unit_price_minor,
+                        clean_currency,
+                        clean_external_ref,
+                        clean_note,
+                        t,
+                        t,
+                        t,
+                    ),
+                )
+                sale_id = cur.lastrowid
+                updated = c.execute(
+                    """UPDATE api_key_inventory
+                       SET stock_status='sold', updated_at=?
+                       WHERE id=?
+                         AND stock_status IN ('in_stock', 'reserved')
+                         AND current_check_status='valid'""",
+                    (t, inventory_id),
+                )
+                if updated.rowcount != 1:
+                    raise InventoryConflictError(
+                        "inventory sale conflict while committing",
+                        conflicts={inventory_id: "concurrent_change"},
+                    )
+                _insert_stock_movement_conn(
+                    c,
+                    inventory_id,
+                    "sale",
+                    row["stock_status"],
+                    "sold",
+                    "inventory_sale",
+                    {"sale_id": sale_id, "currency": clean_currency},
+                    t,
+                    sale_id=sale_id,
+                )
+                _insert_audit_conn(
+                    c,
+                    action="inventory_sell",
+                    target_type="inventory",
+                    target_id=inventory_id,
+                    metadata={
+                        "sale_id": sale_id,
+                        "unit_price_minor": unit_price_minor,
+                        "currency": clean_currency,
+                    },
+                    created_at=t,
+                )
+                sale_ids.append(sale_id)
+            return {"sold": len(sale_ids), "sale_ids": sale_ids}
+    except sqlite3.IntegrityError as exc:
+        raise InventoryConflictError("inventory sale conflict") from exc
+
+
+def return_inventory(ids: list[int], reason: str) -> dict:
+    inventory_ids = _unique_ids(ids)
+    if not inventory_ids:
+        return {"returned": 0, "sale_ids": []}
+    clean_reason = (reason or "").strip()
+    if not clean_reason:
+        raise ValueError("return reason is required")
+    placeholders = ",".join("?" for _ in inventory_ids)
+    t = now()
+
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute(
+            f"""SELECT i.id, i.stock_status, s.id AS sale_id
+                FROM api_key_inventory i
+                LEFT JOIN sales s
+                  ON s.inventory_id=i.id AND s.status='sold'
+                WHERE i.id IN ({placeholders})
+                  AND i.supplier_id IS NOT NULL
+                  AND i.batch_id IS NOT NULL""",
+            inventory_ids,
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        conflicts: dict[int, str] = {}
+        for inventory_id in inventory_ids:
+            row = by_id.get(inventory_id)
+            if not row:
+                conflicts[inventory_id] = "not_formal_inventory"
+            elif row["stock_status"] != "sold":
+                conflicts[inventory_id] = f"stock_status:{row['stock_status']}"
+            elif row["sale_id"] is None:
+                conflicts[inventory_id] = "active_sale_not_found"
+        if conflicts:
+            raise InventoryConflictError(
+                f"inventory return conflict for {len(conflicts)} item(s)",
+                conflicts=conflicts,
+            )
+
+        sale_ids: list[int] = []
+        for inventory_id in inventory_ids:
+            sale_id = by_id[inventory_id]["sale_id"]
+            updated_sale = c.execute(
+                """UPDATE sales
+                   SET status='returned', returned_at=?, return_reason=?, updated_at=?
+                   WHERE id=? AND status='sold'""",
+                (t, clean_reason, t, sale_id),
+            )
+            updated_inventory = c.execute(
+                """UPDATE api_key_inventory
+                   SET stock_status='returned', current_check_status='pending', updated_at=?
+                   WHERE id=? AND stock_status='sold'""",
+                (t, inventory_id),
+            )
+            if updated_sale.rowcount != 1 or updated_inventory.rowcount != 1:
+                raise InventoryConflictError(
+                    "inventory return conflict while committing",
+                    conflicts={inventory_id: "concurrent_change"},
+                )
+            _insert_stock_movement_conn(
+                c,
+                inventory_id,
+                "return",
+                "sold",
+                "returned",
+                clean_reason,
+                {"sale_id": sale_id},
+                t,
+                sale_id=sale_id,
+            )
+            _insert_audit_conn(
+                c,
+                action="inventory_return",
+                target_type="inventory",
+                target_id=inventory_id,
+                metadata={"sale_id": sale_id},
+                created_at=t,
+            )
+            sale_ids.append(sale_id)
+        return {"returned": len(sale_ids), "sale_ids": sale_ids}
 
 
 def prepare_inventory_recheck(ids: list[int]) -> dict:
@@ -1228,19 +1961,9 @@ def prepare_inventory_recheck(ids: list[int]) -> dict:
 
             c.execute(
                 """UPDATE api_key_inventory
-                   SET key_id=?, stock_status='pending_check', updated_at=?
+                   SET key_id=?, current_check_status='pending', updated_at=?
                    WHERE id=?""",
                 (key_id, t, inventory_id),
-            )
-            _insert_movement_if_status_changed_conn(
-                c,
-                inventory_id,
-                "inventory_recheck",
-                row["stock_status"],
-                "pending_check",
-                "manual_recheck",
-                {"key_id": key_id},
-                t,
             )
             key_ids.append(key_id)
     return {"key_ids": key_ids, "queued": len(key_ids), "skipped": skipped}
@@ -1263,6 +1986,31 @@ def export_inventory_entries(ids: list[int]) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def export_sold_entries(ids: list[int]) -> list[dict]:
+    """Return full-key export rows for the requested currently-sold inventory IDs."""
+    inventory_ids = _unique_ids(ids)
+    if not inventory_ids:
+        return []
+    placeholders = ",".join("?" for _ in inventory_ids)
+    with conn() as c:
+        rows = c.execute(
+            f"""SELECT i.id AS inventory_id, i.api_key, i.provider, i.tier,
+                       s.id AS sale_id, s.buyer, s.unit_price_minor, s.currency,
+                       s.external_ref, s.note, s.status AS sale_status,
+                       s.sold_at, s.returned_at
+                FROM api_key_inventory i
+                JOIN sales s
+                  ON s.inventory_id=i.id AND s.status='sold'
+                WHERE i.id IN ({placeholders})
+                  AND i.stock_status='sold'
+                  AND i.supplier_id IS NOT NULL
+                  AND i.batch_id IS NOT NULL
+                ORDER BY i.id""",
+            inventory_ids,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def inventory_stats() -> dict:
     with conn() as c:
         total = c.execute(
@@ -1274,6 +2022,19 @@ def inventory_stats() -> dict:
                WHERE supplier_id IS NOT NULL AND batch_id IS NOT NULL
                GROUP BY stock_status"""
         ).fetchall()}
+        sellable = c.execute(
+            """SELECT COUNT(*) FROM api_key_inventory
+               WHERE supplier_id IS NOT NULL
+                 AND batch_id IS NOT NULL
+                 AND stock_status='in_stock'
+                 AND current_check_status='valid'"""
+        ).fetchone()[0]
+        sold = c.execute(
+            """SELECT COUNT(*) FROM api_key_inventory
+               WHERE supplier_id IS NOT NULL
+                 AND batch_id IS NOT NULL
+                 AND stock_status='sold'"""
+        ).fetchone()[0]
         by_provider = {r[0] or "?": r[1] for r in c.execute(
             """SELECT provider, COUNT(*) FROM api_key_inventory
                WHERE supplier_id IS NOT NULL AND batch_id IS NOT NULL
@@ -1313,6 +2074,7 @@ def inventory_stats() -> dict:
     return {
         "total": total,
         "by_status": by_status,
+        "by_sale_state": {"sellable": sellable, "sold": sold},
         "by_provider": by_provider,
         "by_risk_flag": by_risk_flag,
         "suppliers": suppliers,
@@ -1325,6 +2087,20 @@ def get_key(key_id: int) -> dict | None:
     with conn() as c:
         row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
         return dict(row) if row else None
+
+
+def get_key_entries(ids: list[int]) -> list[dict]:
+    key_ids = _unique_ids(ids)
+    if not key_ids:
+        return []
+    placeholders = ",".join("?" for _ in key_ids)
+    with conn() as c:
+        rows = c.execute(
+            f"SELECT * FROM keys WHERE id IN ({placeholders})",
+            key_ids,
+        ).fetchall()
+        by_id = {row["id"]: dict(row) for row in rows}
+        return [by_id[key_id] for key_id in key_ids if key_id in by_id]
 
 
 def list_keys(provider: str | None = None, status: str | None = None, tier: str | None = None) -> list[dict]:
@@ -1351,15 +2127,23 @@ def delete_keys(ids: list[int]) -> int:
     placeholders = ",".join("?" for _ in ids)
     with conn() as c:
         cur = c.execute(f"DELETE FROM keys WHERE id IN ({placeholders})", ids)
+        if cur.rowcount:
+            _insert_audit_conn(
+                c,
+                action="keys_delete",
+                target_type="keys",
+                metadata={"requested_ids": _unique_ids(ids), "deleted": cur.rowcount},
+            )
         return cur.rowcount
 
 
-def create_job(total: int, concurrency: int) -> int:
+def create_job(total: int, concurrency: int, mode: str = "quick") -> int:
     t = now()
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO jobs (total, concurrency, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (total, concurrency, t, t),
+            """INSERT INTO jobs (total, concurrency, mode, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (total, concurrency, mode or "quick", t, t),
         )
         return cur.lastrowid
 
