@@ -8,8 +8,8 @@ This project is evolving from a detector into a lightweight API key inventory sy
 
 ## Features
 
-- **Auto-detect provider** from key string (`sk-proj-…`, `sk-ant-…`, `AIza…`, `AKIA…|SecretAccessKey`).
-- **AWS Bedrock**: validates long-term AWS credentials, proves Claude Opus access with a minimal `Converse` call, and offers an explicit multi-region deep check for model and quota details.
+- **Auto-detect provider** from key string (`sk-proj-…`, `sk-ant-…`, `AIza…`, `AKIA…|SecretAccessKey`); region-suffixed AWS input is normalized to the same credential.
+- **AWS Bedrock**: validates long-term AWS credentials, discovers Claude Opus inference profiles across all known Bedrock regions, proves access with minimal `InvokeModel` calls, records regional Opus model and quota details, and expands TXT copy/export into `AccessKey|Secret|region` lines only for regions with a successful runtime invocation.
 - **OpenAI**: tier inferred from `x-ratelimit-limit-tokens` header; additionally probes access to `gpt-image-2` and `sora-2`.
 - **Gemini**: reads every page of model metadata, distinguishes callable capabilities via `supportedGenerationMethods`, then burst-tests `gemini-2.5-pro` (with Flash fallback) until the first `429` — records measured RPM and maps to T1/T2/T3 (per user spec: <300 → T1, 300–1300 → T2, >1300 → T3).
 - **Anthropic**: reads `anthropic-ratelimit-requests-limit` header when present, lists `/v1/models` for target model availability, otherwise burst-tests `claude-haiku-4-5`.

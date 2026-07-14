@@ -93,6 +93,7 @@ def _run_migrations(c: sqlite3.Connection):
     migrations: list[Migration] = [
         (1, "inventory_foundation", _migration_inventory_foundation),
         (2, "inventory_sales_and_check_state", _migration_inventory_sales_v2),
+        (3, "job_detail_progress", _migration_job_detail_progress),
     ]
     for version, name, fn in migrations:
         row = c.execute(
@@ -366,6 +367,13 @@ def _migration_inventory_sales_v2(c: sqlite3.Connection):
     _scrub_persisted_proxy_data(c)
 
 
+def _migration_job_detail_progress(c: sqlite3.Connection):
+    """Add backward-compatible region/stage progress for long deep checks."""
+    _add_column_if_missing(c, "jobs", "detail_total", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(c, "jobs", "detail_done", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(c, "jobs", "detail_label", "TEXT")
+
+
 def _create_inventory_schema(c: sqlite3.Connection):
     c.executescript("""
     CREATE TABLE IF NOT EXISTS suppliers (
@@ -605,6 +613,31 @@ def _stock_status_from_check_status(status: str | None, *, is_formal_inventory: 
         "pending": "pending_check",
         "checking": "pending_check",
     }.get(status or "", "pending_check")
+
+
+def _is_callable_valid_check(
+    provider: str | None,
+    status: str | None,
+    extra: dict | str | None,
+) -> bool:
+    """Require runtime proof before a Bedrock result can enter formal stock."""
+    if status != "valid":
+        return False
+    if provider != "aws_bedrock":
+        return True
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(extra, dict) or extra.get("invocation_verification") != "success":
+        return False
+    summary = extra.get("model_summary")
+    return (
+        isinstance(summary, dict)
+        and isinstance(summary.get("successful_regions"), list)
+        and bool(summary["successful_regions"])
+    )
 
 
 def _json_dumps(value) -> str:
@@ -1133,8 +1166,13 @@ def save_result(key_id: int, result: dict, source: str = "checker"):
             t,
         )
 
-        # Auto-vault on valid status.
-        if status == "valid" and row["provider"]:
+        # Auto-vault only callable results. Bedrock model discovery and STS
+        # validation alone are insufficient proof that runtime inference works.
+        if row["provider"] and _is_callable_valid_check(
+            row["provider"],
+            status,
+            result.get("extra"),
+        ):
             vault_id = _vault_upsert_conn(
                 c, row["api_key"], row["provider"],
                 result.get("tier"), result.get("rpm"), result.get("tpm"),
@@ -1171,6 +1209,8 @@ def list_vault(
     legacy_sale_candidate: bool = False,
 ) -> list[dict]:
     sql = """SELECT v.*,
+                    k.status AS latest_check_status,
+                    k.extra AS latest_check_extra,
                     CASE WHEN instr(COALESCE(v.note, ''), '售出') > 0 THEN 1 ELSE 0 END
                         AS legacy_sale_candidate,
                     CASE
@@ -1189,6 +1229,7 @@ def list_vault(
                      END AS inventory_status
              FROM vault v
              LEFT JOIN api_key_inventory i ON i.api_key = v.api_key
+             LEFT JOIN keys k ON k.api_key = v.api_key
              WHERE 1=1"""
     args = []
     if provider:
@@ -1202,7 +1243,17 @@ def list_vault(
     sql += " ORDER BY v.last_verified_at DESC"
     with conn() as c:
         rows = c.execute(sql, args).fetchall()
-        return [dict(r) for r in rows]
+        results = []
+        for row in rows:
+            result = dict(row)
+            latest_extra = result.pop("latest_check_extra", None)
+            result["is_callable"] = int(_is_callable_valid_check(
+                result.get("provider"),
+                result.get("latest_check_status"),
+                latest_extra,
+            ))
+            results.append(result)
+        return results
 
 
 def get_vault_entries(ids: list[int]) -> list[dict]:
@@ -1364,16 +1415,21 @@ def inbound_from_vault(
             if inventory and inventory["supplier_id"] and inventory["batch_id"]:
                 skipped += 1
                 continue
-            # The vault records the last known valid snapshot, but the keys
-            # table is the source of truth for the current check state.  A key
-            # may have become invalid/no-quota after it entered the vault, so
-            # formal inbound must never revive it as sellable from stale vault
-            # data.  Vault-only legacy rows require a fresh check first.
+            # The keys table is the source of truth for the current check state.
+            # Vault-only legacy rows and stale/failed checks must be revalidated
+            # before they can enter formal inventory.
             key_state = c.execute(
                 """SELECT id, provider, status, tier, rpm, tpm, extra, error, checked_at
                    FROM keys WHERE api_key=?""",
                 (row["api_key"],),
             ).fetchone()
+            if not key_state or not _is_callable_valid_check(
+                key_state["provider"],
+                key_state["status"],
+                key_state["extra"],
+            ):
+                skipped += 1
+                continue
             inbound_rows.append((row, inventory, key_state))
 
         if not inbound_rows:
@@ -1994,7 +2050,7 @@ def export_sold_entries(ids: list[int]) -> list[dict]:
     placeholders = ",".join("?" for _ in inventory_ids)
     with conn() as c:
         rows = c.execute(
-            f"""SELECT i.id AS inventory_id, i.api_key, i.provider, i.tier,
+            f"""SELECT i.id AS inventory_id, i.api_key, i.provider, i.tier, i.extra,
                        s.id AS sale_id, s.buyer, s.unit_price_minor, s.currency,
                        s.external_ref, s.note, s.status AS sale_status,
                        s.sold_at, s.returned_at
@@ -2137,13 +2193,29 @@ def delete_keys(ids: list[int]) -> int:
         return cur.rowcount
 
 
-def create_job(total: int, concurrency: int, mode: str = "quick") -> int:
+def create_job(
+    total: int,
+    concurrency: int,
+    mode: str = "quick",
+    detail_total: int = 0,
+    detail_label: str | None = None,
+) -> int:
     t = now()
     with conn() as c:
         cur = c.execute(
-            """INSERT INTO jobs (total, concurrency, mode, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (total, concurrency, mode or "quick", t, t),
+            """INSERT INTO jobs (
+                   total, concurrency, mode, detail_total, detail_label,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                total,
+                concurrency,
+                mode or "quick",
+                max(0, int(detail_total)),
+                str(detail_label)[:64] if detail_label else None,
+                t,
+                t,
+            ),
         )
         return cur.lastrowid
 
@@ -2153,9 +2225,62 @@ def bump_job(job_id: int, done_delta: int = 1):
         c.execute("UPDATE jobs SET done=done+?, updated_at=? WHERE id=?", (done_delta, now(), job_id))
 
 
+def bump_job_detail(job_id: int, label: str | None = None, done_delta: int = 1):
+    with conn() as c:
+        c.execute(
+            """UPDATE jobs
+                  SET detail_done = CASE
+                          WHEN detail_total > 0
+                          THEN MIN(detail_total, detail_done + ?)
+                          ELSE detail_done + ?
+                      END,
+                      detail_label = ?,
+                      updated_at = ?
+                WHERE id = ?""",
+            (
+                done_delta,
+                done_delta,
+                str(label)[:64] if label else None,
+                now(),
+                job_id,
+            ),
+        )
+
+
+def set_job_detail_label(job_id: int, label: str | None):
+    with conn() as c:
+        c.execute(
+            "UPDATE jobs SET detail_label=?, updated_at=? WHERE id=?",
+            (str(label)[:64] if label else None, now(), job_id),
+        )
+
+
+def cancel_running_jobs(reason: str = "服务重启，任务已中止") -> int:
+    """Close jobs whose in-memory asyncio tasks cannot survive a restart."""
+    with conn() as c:
+        cursor = c.execute(
+            """UPDATE jobs
+                  SET status='cancelled', detail_label=?, updated_at=?
+                WHERE status='running'""",
+            (str(reason)[:64], now()),
+        )
+        return cursor.rowcount
+
+
 def finish_job(job_id: int):
     with conn() as c:
-        c.execute("UPDATE jobs SET status='done', updated_at=? WHERE id=?", (now(), job_id))
+        c.execute(
+            """UPDATE jobs
+                  SET status='done',
+                      detail_done=CASE
+                          WHEN detail_total > 0 THEN detail_total
+                          ELSE detail_done
+                      END,
+                      detail_label=NULL,
+                      updated_at=?
+                WHERE id=?""",
+            (now(), job_id),
+        )
 
 
 def get_job(job_id: int) -> dict | None:

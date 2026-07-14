@@ -97,7 +97,7 @@ class DBInventoryFoundationTests(unittest.TestCase):
             "sales",
             "audit_logs",
         }.issubset(self.table_names()))
-        self.assertEqual(self.counts("schema_migrations")["schema_migrations"], 2)
+        self.assertEqual(self.counts("schema_migrations")["schema_migrations"], 3)
         self.assertEqual(
             self.counts("api_key_inventory", "stock_movements", "check_runs"),
             {"api_key_inventory": 0, "stock_movements": 0, "check_runs": 0},
@@ -274,6 +274,64 @@ class DBInventoryFoundationTests(unittest.TestCase):
         self.assertIsNone(inventory["key_id"])
         self.assertIsNone(check_run["key_id"])
         self.assertEqual(inventory["api_key"], api_key)
+
+    def test_bedrock_requires_runtime_success_before_vault_and_formal_inbound(self):
+        db.init_db()
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        discovered_only = {
+            "status": "valid",
+            "tier": None,
+            "rpm": None,
+            "tpm": None,
+            "error": None,
+            "extra": {
+                "invocation_verification": "inconclusive",
+                "model_summary": {
+                    "supported_regions": ["us-east-1"],
+                    "successful_regions": [],
+                },
+            },
+        }
+        db.save_result(key_id, discovered_only)
+        self.assertEqual(db.list_vault(), [])
+
+        # Simulate a historical false-positive vault row created by an older
+        # checker. It must not be formally inbounded without a fresh runtime
+        # success, even though its saved top-level status is "valid".
+        t = db.now()
+        with db.conn() as c:
+            cur = c.execute(
+                """INSERT INTO vault (
+                       api_key, provider, extra, first_verified_at,
+                       last_verified_at, check_count
+                   ) VALUES (?, 'aws_bedrock', ?, ?, ?, 1)""",
+                (api_key, json.dumps(discovered_only["extra"]), t, t),
+            )
+            vault_id = cur.lastrowid
+
+        rejected = db.inbound_from_vault([vault_id], "AWS Supplier")
+        self.assertEqual(rejected["inbounded"], 0)
+        self.assertEqual(rejected["skipped"], 1)
+        self.assertIsNone(rejected["batch"])
+        self.assertEqual(db.list_vault()[0]["is_callable"], 0)
+
+        callable_result = {
+            **discovered_only,
+            "extra": {
+                "invocation_verification": "success",
+                "model_summary": {
+                    "supported_regions": ["us-east-1", "eu-west-1"],
+                    "successful_regions": ["us-east-1"],
+                },
+            },
+        }
+        db.save_result(key_id, callable_result)
+        self.assertEqual(db.list_vault()[0]["is_callable"], 1)
+        accepted = db.inbound_from_vault([vault_id], "AWS Supplier")
+        self.assertEqual(accepted["inbounded"], 1)
+        inventory = next(row for row in db.list_inventory() if row["api_key"] == api_key)
+        self.assertEqual(inventory["stock_status"], "in_stock")
 
     def test_inventory_status_actions_write_movements(self):
         db.init_db()
@@ -538,7 +596,7 @@ class DBInventoryFoundationTests(unittest.TestCase):
         self.assertEqual(result["batch"]["quantity"], 1)
         self.assertEqual(second["unit_cost"], 12.5)
 
-    def test_inbound_uses_latest_key_check_status_instead_of_stale_vault(self):
+    def test_inbound_skips_stale_vault_when_latest_check_is_not_valid(self):
         db.init_db()
         api_key = "test-inbound-stale-vault"
         key_id = db.upsert_keys([api_key], {api_key: "openai"})[0]
@@ -553,24 +611,33 @@ class DBInventoryFoundationTests(unittest.TestCase):
             "error": "revoked", "extra": {"snapshot": "invalid"},
         })
         result = db.inbound_from_vault([vault["id"]], "Supplier Stale")
-        inventory = next(row for row in db.list_inventory() if row["api_key"] == api_key)
 
-        self.assertEqual(result["inbounded"], 1)
-        self.assertEqual(inventory["stock_status"], "invalid")
-        self.assertEqual(inventory["current_check_status"], "invalid")
-        self.assertEqual(inventory["latest_check_status"], "invalid")
+        self.assertEqual(result["inbounded"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertIsNone(result["batch"])
         self.assertEqual(db.list_inventory(sale_view="sellable"), [])
 
         with db.conn() as c:
+            inventory = c.execute(
+                "SELECT * FROM api_key_inventory WHERE api_key=?",
+                (api_key,),
+            ).fetchone()
+            latest_check = c.execute(
+                "SELECT status FROM check_runs WHERE inventory_id=? ORDER BY id DESC LIMIT 1",
+                (inventory["id"],),
+            ).fetchone()
             movement = c.execute(
                 """SELECT from_status, to_status
                    FROM stock_movements
                    WHERE inventory_id=? AND movement_type='inbound_from_vault'""",
                 (inventory["id"],),
             ).fetchone()
-        self.assertEqual((movement["from_status"], movement["to_status"]), (
-            "invalid", "invalid",
-        ))
+        self.assertEqual(inventory["stock_status"], "invalid")
+        self.assertEqual(inventory["current_check_status"], "invalid")
+        self.assertEqual(latest_check["status"], "invalid")
+        self.assertIsNone(inventory["supplier_id"])
+        self.assertIsNone(inventory["batch_id"])
+        self.assertIsNone(movement)
 
     def test_sale_return_restore_history_and_atomic_conflicts(self):
         db.init_db()

@@ -182,6 +182,68 @@ class AppSalesSecurityTests(unittest.TestCase):
         self.assertTrue(all(api_key not in (row["metadata"] or "") for row in audits))
         self.assertTrue(all(json.loads(row["metadata"])["count"] == 1 for row in audits))
 
+    def test_bedrock_txt_exports_expand_only_callable_regions_across_views(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        db.save_result(
+            key_id,
+            {
+                "status": "valid",
+                "tier": None,
+                "rpm": None,
+                "tpm": None,
+                "error": None,
+                "extra": {
+                    "invocation_verification": "success",
+                    "model_summary": {
+                        "supported_regions": [
+                            "us-east-1",
+                            "US-EAST-2",
+                            "eu-west-1",
+                        ],
+                        "successful_regions": [
+                            "us-east-1",
+                            "US-EAST-2",
+                            "us-east-1",
+                            "invalid region\nunsafe",
+                        ],
+                        "supported_models": [
+                            "global.anthropic.claude-opus-4-8-v1:0",
+                        ],
+                    },
+                },
+            },
+        )
+        vault = next(row for row in db.list_vault() if row["api_key"] == api_key)
+        db.inbound_from_vault([vault["id"]], "AWS Supplier")
+        inventory = next(row for row in db.list_inventory() if row["api_key"] == api_key)
+        expected = "\n".join([
+            f"{api_key}|us-east-1",
+            f"{api_key}|us-east-2",
+        ])
+
+        for endpoint, row_id in (
+            ("/api/keys/export", key_id),
+            ("/api/vault/export", vault["id"]),
+            ("/api/inventory/export", inventory["id"]),
+        ):
+            with self.subTest(endpoint=endpoint):
+                response = self.client.post(
+                    endpoint,
+                    headers=self.headers,
+                    json={"ids": [row_id], "format": "txt"},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.text, expected)
+
+        json_export = self.client.post(
+            "/api/inventory/export",
+            headers=self.headers,
+            json={"ids": [inventory["id"]], "format": "json"},
+        )
+        self.assertEqual(json_export.status_code, 200, json_export.text)
+        self.assertEqual(json_export.json()[0]["api_key"], api_key)
+
     def test_deep_recheck_only_queues_bedrock(self):
         aws_key = "AKIA0000000000000000|" + "A" * 40
         openai_key = "test-openai-deep-skip"
@@ -207,6 +269,28 @@ class AppSalesSecurityTests(unittest.TestCase):
         self.assertEqual(response.json()["skipped"], 1)
         job = db.get_job(response.json()["job_id"])
         self.assertEqual(job["mode"], "bedrock_deep")
+        self.assertGreater(job["detail_total"], 1)
+        self.assertEqual(job["detail_done"], 0)
+        self.assertEqual(job["detail_label"], "准备中")
+
+    def test_running_jobs_route_is_not_shadowed_by_job_id_route(self):
+        job_id = db.create_job(1, 1, mode="quick")
+
+        response = self.client.get("/api/jobs/running", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn(job_id, [job["id"] for job in response.json()["jobs"]])
+
+    def test_interrupted_jobs_are_cancelled_instead_of_staying_running(self):
+        job_id = db.create_job(2, 2, mode="quick", detail_total=10)
+
+        cancelled = db.cancel_running_jobs()
+
+        self.assertEqual(cancelled, 1)
+        job = db.get_job(job_id)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIn("中止", job["detail_label"])
+        self.assertEqual(db.get_running_jobs(), [])
 
     def test_proxy_credentials_are_not_persisted_or_returned(self):
         api_key = "test-openai-proxy-redaction"
@@ -266,6 +350,142 @@ class AppSalesSecurityTests(unittest.TestCase):
         ).text
         self.assertNotIn("proxy-password", response_text)
         self.assertNotIn(proxy, response_text)
+
+    def test_bedrock_deep_check_receives_selected_socks_proxy(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        proxy = "socks5h://proxy-user:proxy-password@127.0.0.1:1080"
+        checker = AsyncMock(return_value={
+            "status": "valid",
+            "tier": None,
+            "rpm": None,
+            "tpm": None,
+            "error": None,
+            "extra": {"proxy_used": True},
+        })
+        pool = MagicMock()
+        pool.get_round_robin = AsyncMock(return_value=proxy)
+        pool.mark_dead = AsyncMock()
+
+        with patch("app.get_pool", return_value=pool), patch(
+            "app.bedrock_checker.deep_check", checker
+        ):
+            asyncio.run(
+                check_one_key(
+                    key_id,
+                    None,
+                    asyncio.Semaphore(1),
+                    use_proxy=True,
+                    mode="bedrock_deep",
+                )
+            )
+
+        checker.assert_awaited_once_with(api_key, proxy=proxy)
+        pool.get_round_robin.assert_awaited_once()
+        pool.mark_dead.assert_not_awaited()
+
+    def test_bedrock_deep_check_updates_region_progress(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        proxy = "socks5h://127.0.0.1:1080"
+
+        async def run_checker(key, *, proxy, progress_callback):
+            self.assertEqual(key, api_key)
+            await progress_callback("STS 验证")
+            await progress_callback("us-east-1")
+            return {
+                "status": "valid",
+                "error": None,
+                "extra": {"proxy_used": True},
+            }
+
+        checker = AsyncMock(side_effect=run_checker)
+        pool = MagicMock()
+        pool.get_round_robin = AsyncMock(return_value=proxy)
+        pool.mark_dead = AsyncMock()
+        job_id = db.create_job(
+            1,
+            1,
+            mode="bedrock_deep",
+            detail_total=2,
+            detail_label="STS 验证",
+        )
+
+        with patch("app.get_pool", return_value=pool), patch(
+            "app.bedrock_checker.deep_check", checker
+        ):
+            asyncio.run(
+                check_one_key(
+                    key_id,
+                    job_id,
+                    asyncio.Semaphore(1),
+                    use_proxy=True,
+                    mode="bedrock_deep",
+                )
+            )
+
+        job = db.get_job(job_id)
+        self.assertEqual(job["done"], 1)
+        self.assertEqual(job["detail_done"], 2)
+        self.assertEqual(job["detail_label"], "us-east-1")
+        db.finish_job(job_id)
+        finished = db.get_job(job_id)
+        self.assertEqual(finished["status"], "done")
+        self.assertEqual(finished["detail_done"], finished["detail_total"])
+        self.assertIsNone(finished["detail_label"])
+
+    def test_proxy_request_never_falls_back_to_direct_connection(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        checker = AsyncMock()
+        pool = MagicMock()
+        pool.get_round_robin = AsyncMock(return_value=None)
+
+        with patch("app.get_pool", return_value=pool), patch(
+            "app.bedrock_checker.deep_check", checker
+        ):
+            asyncio.run(
+                check_one_key(
+                    key_id,
+                    None,
+                    asyncio.Semaphore(1),
+                    use_proxy=True,
+                    mode="bedrock_deep",
+                )
+            )
+
+        checker.assert_not_awaited()
+        result = db.get_key(key_id)
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(json.loads(result["extra"])["proxy_unavailable"])
+
+    def test_bedrock_application_error_does_not_remove_working_proxy(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        proxy = "socks5h://127.0.0.1:1080"
+        checker = AsyncMock(return_value={
+            "status": "error",
+            "error": "Bedrock check failed (AccessDeniedException)",
+            "extra": {"proxy_used": True},
+        })
+        pool = MagicMock()
+        pool.get_round_robin = AsyncMock(return_value=proxy)
+        pool.mark_dead = AsyncMock()
+
+        with patch("app.get_pool", return_value=pool), patch(
+            "app.bedrock_checker.deep_check", checker
+        ):
+            asyncio.run(
+                check_one_key(
+                    key_id,
+                    None,
+                    asyncio.Semaphore(1),
+                    use_proxy=True,
+                    mode="bedrock_deep",
+                )
+            )
+
+        pool.mark_dead.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -204,6 +204,21 @@ function providerBadge(p) {
 	return `<span class="badge ${provider.className}">${provider.label}</span>`;
 }
 
+function effectiveCheckStatus(row) {
+	const status = row?.status || row?.current_check_status || row?.latest_check_status;
+	const summary = row?.extra?.model_summary || {};
+	const throttledRegions = Array.isArray(summary.throttled_regions)
+		? summary.throttled_regions
+		: [];
+	// Historical Bedrock rows may still be persisted as "error" by the old
+	// aggregator. A throttled runtime call proves model authorization, so render
+	// those saved results consistently as quota-limited without rewriting history.
+	if (row?.provider === "aws_bedrock" && status === "error" && throttledRegions.length) {
+		return "no_quota";
+	}
+	return status;
+}
+
 function statusBadge(s) {
 	const map = {
 		valid: "✅ 有效",
@@ -235,6 +250,9 @@ function stockStatusBadge(s) {
 
 function vaultInventoryControl(row) {
 	if (!row.is_in_inventory) {
+		if (!row.is_callable) {
+			return `<button class="btn btn-small" type="button" disabled title="最新检测没有真实模型调用成功">需复检</button>`;
+		}
 		return `<button class="btn btn-small btn-inbound v-row-inbound" type="button" aria-label="将 ${escapeHtml(row.api_key_short || `第 ${row.id} 行`)} 入库">未入库</button>`;
 	}
 	const statusMap = {
@@ -390,16 +408,25 @@ function targetModelChips(supported) {
 function bedrockDetailChipList(extra, compact = false) {
 	const chips = [];
 	const identity = extra.identity || {};
-	const mode = extra.check_mode === "bedrock_deep" || extra.check_mode === "deep"
-		? "11 区域深检"
+	const isDeep = extra.check_mode === "bedrock_deep" || extra.check_mode === "deep";
+	const mode = isDeep
+		? "全区域深检"
 		: "快速检测";
-	chips.push(chip(mode, extra.check_mode === "bedrock_deep" || extra.check_mode === "deep" ? "aws-deep" : ""));
+	chips.push(chip(mode, isDeep ? "aws-deep" : ""));
 
 	const credentialStatus = extra.credential_status || extra.credentials_status || identity.status;
 	if (credentialStatus) {
+		const normalizedCredentialStatus = String(credentialStatus).toLowerCase();
+		const credentialLabels = {
+			verified: "STS 已验证",
+			bedrock_verified: "Bedrock 已验证",
+			sts_unavailable: "STS 未验证",
+			invalid: "凭证失效",
+			invalid_format: "格式错误",
+		};
 		chips.push(chip(
-			`凭证 ${credentialStatus}`,
-			["valid", "verified"].includes(String(credentialStatus).toLowerCase()) ? "on" : "off",
+			credentialLabels[normalizedCredentialStatus] || `凭证 ${credentialStatus}`,
+			["valid", "verified", "bedrock_verified"].includes(normalizedCredentialStatus) ? "on" : "off",
 		));
 	}
 
@@ -414,32 +441,78 @@ function bedrockDetailChipList(extra, compact = false) {
 		? checkedRegions
 		: Object.keys(regionResults || {});
 	const regionCount = regionNames.length || (Number.isFinite(Number(checkedRegions)) ? Number(checkedRegions) : 0);
-	if (regionCount) chips.push(chip(`${regionCount} 区域`, "", regionNames.join("\n")));
+	if (regionCount) chips.push(chip(`已扫描 ${regionCount} 区域`, "", regionNames.join("\n")));
 
 	const modelSummary = extra.model_summary || extra.models_summary || {};
 	const modelList = Array.isArray(modelSummary)
 		? modelSummary
-		: modelSummary.opus_versions || modelSummary.models || extra.opus_versions || [];
+		: modelSummary.supported_models || modelSummary.models || modelSummary.opus_versions || extra.opus_versions || [];
 	const modelCount = Array.isArray(modelList)
 		? modelList.length
-		: Number(modelSummary.count || extra.models_count || 0);
+		: Number(modelSummary.supported_model_count || modelSummary.count || extra.models_count || 0);
 	const profilesFound = Number(modelSummary.profiles_found || 0);
+	const discoveredRegions = Array.isArray(modelSummary.supported_regions)
+		? modelSummary.supported_regions
+		: [];
 	const successfulVersions = Array.isArray(modelSummary.successful_versions)
 		? modelSummary.successful_versions
 		: [];
 	const successfulRegions = Array.isArray(modelSummary.successful_regions)
 		? modelSummary.successful_regions
 		: [];
+	const throttledRegions = Array.isArray(modelSummary.throttled_regions)
+		? modelSummary.throttled_regions
+		: [];
+	const throttledVersions = Array.isArray(modelSummary.throttled_versions)
+		? modelSummary.throttled_versions
+		: [];
+	const throttledModels = Array.isArray(modelSummary.throttled_models)
+		? modelSummary.throttled_models
+		: [];
 	const latestModel = modelSummary.latest || modelSummary.latest_model || extra.latest_model || extra.probe_model;
-	if (latestModel) chips.push(chip(String(latestModel), "on", String(latestModel)));
+	if (successfulRegions.length) {
+		chips.push(chip(`可调用区域 ${successfulRegions.length}`, "on", successfulRegions.join("\n")));
+	}
+	if (discoveredRegions.length && !compact) {
+		chips.push(chip(`发现区域 ${discoveredRegions.length}`, "", discoveredRegions.join("\n")));
+	}
+	if (modelCount) {
+		chips.push(chip(`Opus 模型 ×${modelCount}`, "", Array.isArray(modelList) ? modelList.join("\n") : ""));
+	} else if (latestModel) chips.push(chip(String(latestModel), "on", String(latestModel)));
 	else if (successfulVersions.length) {
 		chips.push(chip(`可调用 Opus ×${successfulVersions.length}`, "on", successfulVersions.join("\n")));
-	} else if (modelCount) {
-		chips.push(chip(`Opus ×${modelCount}`, "", Array.isArray(modelList) ? modelList.join("\n") : ""));
 	}
 	if (profilesFound && !compact) chips.push(chip(`Profiles ${profilesFound}`));
-	if (successfulRegions.length && !compact) {
-		chips.push(chip(`成功区域 ${successfulRegions.length}`, "on", successfulRegions.join("\n")));
+	if (throttledRegions.length) {
+		const versionLabel = throttledVersions.length
+			? `Opus ${throttledVersions.join("/")}`
+			: "Opus";
+		const throttleTitle = [
+			"已通过 Bedrock 模型鉴权，但当前受到调用频率或额度限制。",
+			`受限区域：\n${throttledRegions.join("\n")}`,
+			throttledModels.length ? `受限模型：\n${throttledModels.join("\n")}` : "",
+		].filter(Boolean).join("\n\n");
+		chips.push(chip(
+			`${versionLabel} 限流 · ${throttledRegions.length} 区域`,
+			"warn",
+			throttleTitle,
+		));
+	}
+	if (!compact && extra.invocation_verification === "inconclusive") {
+		chips.push(chip(
+			"仅发现模型，未调用成功",
+			"off",
+			"这条历史结果没有完成真实模型调用，必须重新检测成功后才能入库",
+		));
+	}
+	if (!compact && extra.invocation_verification === "failed") {
+		chips.push(chip(
+			"InvokeModel 调用失败",
+			"off",
+			extra.runtime_restriction === "operation_not_allowed"
+				? "AWS 拒绝模型运行时调用（Operation not allowed）"
+				: "没有任何 Opus 模型完成真实 InvokeModel 调用",
+		));
 	}
 
 	const quotas = extra.quotas || extra.service_quotas;
@@ -450,7 +523,9 @@ function bedrockDetailChipList(extra, compact = false) {
 	const failures = extra.partial_failures || extra.failures || [];
 	const failureCount = Array.isArray(failures) ? failures.length : Object.keys(failures || {}).length;
 	if (failureCount) chips.push(chip(`部分失败 ${failureCount}`, "off", `${failureCount} 个区域或步骤失败`));
-	if (extra.proxy_ignored && !compact) chips.push(chip("直连（已忽略代理）", "", "AWS Bedrock 检测不使用 SOCKS5 代理"));
+	if (extra.proxy_used && !compact) chips.push(chip("SOCKS5 代理", "on", "本次 AWS Bedrock 检测已通过 SOCKS5 代理发送"));
+	else if (extra.proxy_unavailable && !compact) chips.push(chip("代理池无可用节点", "off", "为避免意外直连，本次检测已停止"));
+	else if (extra.proxy_ignored && !compact) chips.push(chip("直连（代理未生效）", "off", "本次 AWS Bedrock 检测未使用所选代理"));
 	return chips;
 }
 
@@ -513,8 +588,14 @@ function detailChips(r) {
 	} else if (r.provider === "aws_bedrock") {
 		chips.push(...bedrockDetailChipList(e));
 	}
-	if (r.error)
-		chips.push(chip(`❗ ${r.error.slice(0, 24)}`, "off", r.error));
+	if (r.error) {
+		const quotaLimited = effectiveCheckStatus(r) === "no_quota";
+		chips.push(chip(
+			`${quotaLimited ? "⚠" : "❗"} ${r.error.slice(0, 36)}`,
+			quotaLimited ? "warn" : "off",
+			r.error,
+		));
+	}
 	return `<div class="detail-chips">${chips.join("")}</div>`;
 }
 
@@ -586,9 +667,10 @@ function render() {
 		invalid = 0,
 		pending = 0;
 	for (const r of state.keys) {
-		if (r.status === "valid") valid++;
-		else if (r.status === "no_quota") noQuota++;
-		else if (r.status === "invalid") invalid++;
+		const displayStatus = effectiveCheckStatus(r);
+		if (displayStatus === "valid") valid++;
+		else if (displayStatus === "no_quota") noQuota++;
+		else if (displayStatus === "invalid") invalid++;
 		else pending++;
 
 		const tr = document.createElement("tr");
@@ -597,7 +679,7 @@ function render() {
       <td class="col-cb"><label class="checkbox-hitarea"><input type="checkbox" class="cb-row" aria-label="选择 ${escapeHtml(r.api_key_short || `第 ${r.id} 行`)}" ${state.selected.has(r.id) ? "checked" : ""}></label></td>
       <td>${providerBadge(r.provider)}</td>
       <td class="key-cell masked" title="完整 Key 需选中后复制">${escapeHtml(r.api_key_short)}</td>
-      <td>${statusBadge(r.status)}</td>
+      <td>${statusBadge(displayStatus)}</td>
       <td>${tierBadge(r.tier)}</td>
       <td>${fmt(r.rpm)}</td>
       <td>${fmt(r.tpm)}</td>
@@ -653,14 +735,55 @@ async function requestSecretText(endpoint, ids, format = "txt") {
 	return response.text();
 }
 
+function secretTextLineCount(text) {
+	return text.split("\n").filter((line) => line.trim()).length;
+}
+
+async function copySecretText(text) {
+	if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+		try {
+			await navigator.clipboard.writeText(text);
+			return;
+		} catch (_) {
+			// Some browsers lose clipboard permission/focus after an async request
+			// or native confirm dialog. Fall through to the selection-based copy.
+		}
+	}
+
+	const activeElement = document.activeElement;
+	const textarea = document.createElement("textarea");
+	textarea.value = text;
+	textarea.readOnly = true;
+	textarea.setAttribute("aria-hidden", "true");
+	textarea.style.position = "fixed";
+	textarea.style.left = "-9999px";
+	textarea.style.top = "0";
+	textarea.style.opacity = "0";
+	document.body.appendChild(textarea);
+	textarea.focus();
+	textarea.select();
+	textarea.setSelectionRange(0, textarea.value.length);
+	let copied = false;
+	try {
+		copied = document.execCommand("copy");
+	} finally {
+		textarea.remove();
+		if (activeElement && typeof activeElement.focus === "function") activeElement.focus();
+	}
+	if (!copied) throw new Error("浏览器阻止了剪贴板访问，请允许剪贴板权限后重试");
+}
+
 function bedrockIds(rows) {
 	return rows.filter((row) => row.provider === "aws_bedrock").map((row) => row.id);
 }
 
-function confirmBedrockDeep(count, skipped = 0) {
+function confirmBedrockDeep(count, skipped = 0, useProxy = false) {
 	const skippedText = skipped ? `\n另有 ${skipped} 个非 Bedrock 项不会处理。` : "";
+	const connectionText = useProxy
+		? "本次检测将使用已勾选的 SOCKS5 代理池。"
+		: "本次检测将直连 AWS。";
 	return confirm(
-		`确认深检 ${count} 个 AWS Bedrock Key？\n将扫描 11 个区域并执行真实模型调用，可能产生费用；检测始终直连，不使用 SOCKS5 代理。${skippedText}`,
+		`确认深检 ${count} 个 AWS Bedrock Key？\n将扫描全部已知 Bedrock 区域，仅发现并调用 Claude Opus；真实模型调用可能产生费用。${connectionText}${skippedText}`,
 	);
 }
 
@@ -669,10 +792,23 @@ async function pollJob() {
 	if (!state.jobId) return;
 	try {
 		const j = await api("GET", `/api/jobs/${state.jobId}`);
-		const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
+		const detailTotal = Number(j.detail_total || 0);
+		const detailDone = Number(j.detail_done || 0);
+		const hasDetailProgress = detailTotal > 0;
+		const progressTotal = hasDetailProgress ? detailTotal : Number(j.total || 0);
+		const progressDone = hasDetailProgress ? detailDone : Number(j.done || 0);
+		const pct = progressTotal
+			? Math.min(100, Math.round((progressDone / progressTotal) * 100))
+			: 0;
 		$("#job-bar-fill").style.width = pct + "%";
-		$("#job-text").textContent =
-			`Job #${j.id} · ${j.done}/${j.total} (${pct}%) · ${j.status}`;
+		if (hasDetailProgress) {
+			const current = j.detail_label ? ` · 当前 ${j.detail_label}` : "";
+			$("#job-text").textContent =
+				`Job #${j.id} · Key ${j.done}/${j.total} · 检测步骤 ${detailDone}/${detailTotal} (${pct}%)${current} · ${j.status}`;
+		} else {
+			$("#job-text").textContent =
+				`Job #${j.id} · ${j.done}/${j.total} (${pct}%) · ${j.status}`;
+		}
 
 		// refresh keys table every poll
 		await loadKeys();
@@ -682,11 +818,11 @@ async function pollJob() {
 		if (!$("#view-vault").classList.contains("hidden")) await loadVault();
 		if (!$("#view-inventory").classList.contains("hidden")) await loadInventory();
 
-		if (j.status === "done") {
+		if (["done", "cancelled"].includes(j.status)) {
 			clearInterval(state.jobPollTimer);
 			state.jobPollTimer = null;
 			state.jobId = null;
-			toast("✅ 检测完成");
+			toast(j.status === "done" ? "✅ 检测完成" : "检测任务已中止，请重新提交");
 			setTimeout(() => $("#job-status").classList.add("hidden"), 2500);
 		}
 	} catch (e) {
@@ -766,8 +902,8 @@ $("#btn-copy").addEventListener("click", async () => {
 	if (!ids.length) return toast("请先选择");
 	try {
 		const text = await requestSecretText("/api/keys/export", ids);
-		await navigator.clipboard.writeText(text);
-		toast(`已复制 ${ids.length} 个完整 Key（操作已审计）`);
+		await copySecretText(text);
+		toast(`已复制 ${secretTextLineCount(text)} 行（${ids.length} 个 Key，操作已审计）`);
 	} catch (e) {
 		toast("复制失败：" + e.message);
 	}
@@ -797,14 +933,15 @@ $("#btn-bedrock-deep").addEventListener("click", async () => {
 	const selected = selectedKeyObjs();
 	const ids = bedrockIds(selected);
 	if (!ids.length) return toast("请先选择 AWS Bedrock Key");
-	if (!confirmBedrockDeep(ids.length, selected.length - ids.length)) return;
+	const useProxy = $("#use-proxy").checked;
+	if (!confirmBedrockDeep(ids.length, selected.length - ids.length, useProxy)) return;
 	state.deepBusy = true;
 	syncCheckSelectionControls();
 	try {
 		const r = await api("POST", "/api/keys/recheck", {
 			ids,
 			concurrency: Math.min(parseInt($("#concurrency").value, 10) || 2, 2),
-			use_proxy: false,
+			use_proxy: useProxy,
 			mode: "bedrock_deep",
 		});
 		toast(`已加入 Bedrock 深检 ${r.queued} 个${r.skipped ? `，跳过 ${r.skipped} 个` : ""}`);
@@ -883,7 +1020,7 @@ function selectedVisibleVaultIds() {
 
 function selectedPendingInboundVaultIds() {
 	return selectedVisibleVaultRows()
-		.filter((r) => !r.is_in_inventory)
+		.filter((r) => !r.is_in_inventory && r.is_callable)
 		.map((r) => r.id);
 }
 
@@ -1019,8 +1156,8 @@ $("#v-btn-copy").addEventListener("click", async () => {
 	if (!ids.length) return toast("请先选择");
 	try {
 		const text = await requestSecretText("/api/vault/export", ids);
-		await navigator.clipboard.writeText(text);
-		toast(`已复制 ${ids.length} 个完整 Key（操作已审计）`);
+		await copySecretText(text);
+		toast(`已复制 ${secretTextLineCount(text)} 行（${ids.length} 个 Key，操作已审计）`);
 	} catch (e) {
 		toast("复制失败：" + e.message);
 	}
@@ -1052,14 +1189,15 @@ $("#v-btn-bedrock-deep").addEventListener("click", async () => {
 	const selected = selectedVisibleVaultRows();
 	const ids = bedrockIds(selected);
 	if (!ids.length) return toast("请先选择 AWS Bedrock Key");
-	if (!confirmBedrockDeep(ids.length, selected.length - ids.length)) return;
+	const useProxy = $("#use-proxy").checked;
+	if (!confirmBedrockDeep(ids.length, selected.length - ids.length, useProxy)) return;
 	vaultState.deepBusy = true;
 	syncVaultSelectionControls();
 	try {
 		const r = await api("POST", "/api/vault/recheck", {
 			ids,
 			concurrency: Math.min(parseInt($("#concurrency").value, 10) || 2, 2),
-			use_proxy: false,
+			use_proxy: useProxy,
 			mode: "bedrock_deep",
 		});
 		toast(`已加入 Bedrock 深检 ${r.queued} 个${r.skipped ? `，跳过 ${r.skipped} 个` : ""}`);
@@ -1406,7 +1544,7 @@ function renderInventory() {
 		const costText = r.unit_cost !== null && r.unit_cost !== undefined
 			? fmtMoney(r.unit_cost)
 			: fmtMoney(r.batch_total_cost);
-		const checkStatus = r.current_check_status || r.latest_check_status;
+		const checkStatus = effectiveCheckStatus(r);
 		tr.innerHTML = `
       <td class="col-cb"><label class="checkbox-hitarea"><input type="checkbox" class="i-cb-row" aria-label="选择 ${escapeHtml(r.api_key_short || `第 ${r.id} 行`)}" ${inventoryState.selected.has(r.id) ? "checked" : ""}></label></td>
       <td>${providerBadge(r.provider)}</td>
@@ -1499,13 +1637,14 @@ async function deepCheckInventorySelected() {
 	const selected = selectedInventoryObjs();
 	const ids = bedrockIds(selected);
 	if (!ids.length) return toast("请先选择 AWS Bedrock Key");
-	if (!confirmBedrockDeep(ids.length, selected.length - ids.length)) return;
+	const useProxy = $("#use-proxy").checked;
+	if (!confirmBedrockDeep(ids.length, selected.length - ids.length, useProxy)) return;
 	setInventoryBusy(true);
 	try {
 		const r = await api("POST", "/api/inventory/recheck", {
 			ids,
 			concurrency: Math.min(parseInt($("#concurrency").value, 10) || 2, 2),
-			use_proxy: false,
+			use_proxy: useProxy,
 			mode: "bedrock_deep",
 		});
 		toast(`已加入 Bedrock 深检 ${r.queued} 个${r.skipped ? `，跳过 ${r.skipped} 个` : ""}`);
@@ -1519,20 +1658,24 @@ async function deepCheckInventorySelected() {
 	}
 }
 
-async function exportInventorySelected(format = "txt", endpoint = "/api/inventory/export") {
+async function exportInventorySelected(
+	format = "txt",
+	endpoint = "/api/inventory/export",
+	requireConfirmation = true,
+) {
 	const ids = [...inventoryState.selected];
 	if (!ids.length) return toast("请先选择库存");
-	if (!confirm(`确认导出 ${ids.length} 个完整 Key？`)) return null;
+	if (requireConfirmation && !confirm(`确认导出 ${ids.length} 个完整 Key？`)) return null;
 	const response = await apiResponse("POST", endpoint, { ids, format });
 	return format === "json" ? response.json() : response.text();
 }
 
 async function copyInventorySelected() {
 	try {
-		const text = await exportInventorySelected("txt");
+		const text = await exportInventorySelected("txt", "/api/inventory/export", false);
 		if (!text) return;
-		await navigator.clipboard.writeText(text);
-		toast(`已复制 ${text.split("\n").filter(Boolean).length} 个完整 Key`);
+		await copySecretText(text);
+		toast(`已复制 ${secretTextLineCount(text)} 行完整 Key`);
 	} catch (e) {
 		toast("复制失败：" + e.message);
 	}
@@ -1683,9 +1826,9 @@ function renderInventoryDetail(data) {
 	const sales = data.sales || [];
 	const checkRows = checks.length
 		? checks.map((r) => `
-        <tr>
-          <td>${fmtTime(r.checked_at)}</td>
-          <td>${statusBadge(r.status)}</td>
+	        <tr>
+	          <td>${fmtTime(r.checked_at)}</td>
+	          <td>${statusBadge(effectiveCheckStatus(r))}</td>
           <td>${tierBadge(r.tier)}</td>
           <td>${fmt(r.rpm)}</td>
           <td>${fmt(r.tpm)}</td>
@@ -1726,7 +1869,7 @@ function renderInventoryDetail(data) {
       <div><b>批次</b><span>${escapeHtml(item.batch_name || "—")}</span></div>
       <div><b>成本</b><span>${fmtMoney(item.unit_cost)}</span></div>
       <div><b>风险</b><span>${escapeHtml(item.risk_flag || "—")}</span></div>
-      <div><b>最近质检</b><span>${statusBadge(item.current_check_status || item.latest_check_status)}</span></div>
+	      <div><b>最近质检</b><span>${statusBadge(effectiveCheckStatus(item))}</span></div>
       <div><b>买家</b><span>${escapeHtml(item.buyer || "—")}</span></div>
       <div><b>售价</b><span>${fmtSaleMoney(item.unit_price_minor, item.currency)}</span></div>
       <div><b>售出时间</b><span>${fmtTime(item.sold_at)}</span></div>

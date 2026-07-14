@@ -25,12 +25,20 @@ class BedrockDetectorTests(unittest.TestCase):
         )
         self.assertEqual(detect_provider(f"{ACCESS_KEY_ID}|{fullwidth_secret}"), "aws_bedrock")
 
-    def test_rejects_temporary_malformed_and_multi_part_credentials(self):
+    def test_region_suffix_is_accepted_ignored_and_deduplicated(self):
+        region_key = f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}|us-east-2"
+
+        self.assertEqual(normalize_key(region_key), f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}")
+        self.assertEqual(parse_bedrock_key(region_key), (ACCESS_KEY_ID, SECRET_ACCESS_KEY))
+        self.assertEqual(detect_provider(region_key), "aws_bedrock")
+
+    def test_rejects_temporary_malformed_and_extra_part_credentials(self):
         temporary = "ASIAABCDEFGHIJKLMNOP"
 
         self.assertIsNone(detect_provider(f"{temporary}|{SECRET_ACCESS_KEY}"))
         self.assertIsNone(detect_provider(f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY[:-1]}"))
-        self.assertIsNone(detect_provider(f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}|us-east-1"))
+        self.assertIsNone(detect_provider(f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}|not-a-region"))
+        self.assertIsNone(detect_provider(f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}|us-east-1|extra"))
         self.assertIsNone(detect_provider(f"{ACCESS_KEY_ID.lower()}|{SECRET_ACCESS_KEY}"))
 
     def test_non_aws_normalization_only_strips_outer_whitespace(self):

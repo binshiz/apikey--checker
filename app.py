@@ -32,7 +32,7 @@ def require_auth(request: Request):
     token = request.headers.get("X-Admin-Key", "")
     if token != ADMIN_KEY:
         raise HTTPException(401, "unauthorized")
-from detector import detect_provider, normalize_key, short_key
+from detector import detect_provider, normalize_key, parse_bedrock_key, short_key
 from checkers import openai as openai_checker
 from checkers import anthropic as anthropic_checker
 from checkers import gemini as gemini_checker
@@ -51,7 +51,7 @@ CHECKER_SUPPORTS_PROXY = {
     "openai": True,
     "anthropic": True,
     "gemini": True,
-    "aws_bedrock": False,
+    "aws_bedrock": True,
 }
 
 CheckMode = Literal["quick", "bedrock_deep"]
@@ -93,6 +93,9 @@ def _sanitize_result_extra(value: Any) -> Any:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    interrupted = db.cancel_running_jobs()
+    if interrupted:
+        print(f"[jobs] cancelled {interrupted} interrupted job(s) after restart")
     pool = get_pool()
     if pool.count > 0:
         print(f"[proxy pool] {pool.count} proxies loaded (lazy health check — tested on use)")
@@ -108,6 +111,25 @@ templates = Jinja2Templates(directory=os.path.join(ROOT, "templates"))
 # Background checker
 # ────────────────────────────────────────────────────────────────────
 
+def _create_check_job(
+    key_ids: list[int],
+    concurrency: int,
+    mode: CheckMode,
+) -> int:
+    region_steps = len(bedrock_checker.configured_regions()) + 1
+    detail_total = 0
+    for key_id in key_ids:
+        info = db.get_key(key_id)
+        detail_total += region_steps if info and info.get("provider") == "aws_bedrock" else 1
+    return db.create_job(
+        len(key_ids),
+        concurrency,
+        mode=mode,
+        detail_total=detail_total,
+        detail_label="准备中" if detail_total else None,
+    )
+
+
 async def check_one_key(
     key_id: int,
     job_id: int | None,
@@ -119,6 +141,7 @@ async def check_one_key(
         info = db.get_key(key_id)
         if not info:
             if job_id:
+                db.bump_job_detail(job_id, "记录不存在")
                 db.bump_job(job_id)
             return
         provider = info["provider"]
@@ -129,6 +152,7 @@ async def check_one_key(
                 "extra": {},
             }, source="checker")
             if job_id:
+                db.bump_job_detail(job_id, "无法识别")
                 db.bump_job(job_id)
             return
 
@@ -139,29 +163,56 @@ async def check_one_key(
         if use_proxy and CHECKER_SUPPORTS_PROXY.get(provider, False):
             proxy = await get_pool().get_round_robin()
 
-        try:
-            checker = (
-                bedrock_checker.deep_check
-                if provider == "aws_bedrock" and mode == "bedrock_deep"
-                else CHECKERS[provider]
-            )
-            if proxy:
-                result = await checker(info["api_key"], proxy=proxy)
-            else:
-                result = await checker(info["api_key"])
-        except Exception as e:
+        checker = (
+            bedrock_checker.deep_check
+            if provider == "aws_bedrock" and mode == "bedrock_deep"
+            else CHECKERS[provider]
+        )
+        if use_proxy and CHECKER_SUPPORTS_PROXY.get(provider, False) and not proxy:
             result = {
                 "status": "error",
-                "error": _redact_proxy_urls(f"{type(e).__name__}: {e}"),
-                "extra": {},
+                "error": "SOCKS5 proxy pool has no available proxy",
+                "extra": {
+                    "proxy_requested": True,
+                    "proxy_unavailable": True,
+                },
             }
-            if proxy:
-                await get_pool().mark_dead(proxy)
-                result["extra"]["proxy_dead"] = True
+        else:
+            try:
+                checker_kwargs = {}
+                if proxy:
+                    checker_kwargs["proxy"] = proxy
+                if job_id and provider == "aws_bedrock":
+                    async def report_progress(label: str):
+                        db.bump_job_detail(job_id, label)
+
+                    checker_kwargs["progress_callback"] = report_progress
+                result = await checker(info["api_key"], **checker_kwargs)
+            except Exception as e:
+                result = {
+                    "status": "error",
+                    "error": _redact_proxy_urls(f"{type(e).__name__}: {e}"),
+                    "extra": {},
+                }
+                if proxy:
+                    await get_pool().mark_dead(proxy)
+                    result["extra"]["proxy_dead"] = True
 
         # If the error looks like a proxy/connection failure, mark it dead
         err_str = (result.get("error") or "").lower()
-        if proxy and (result.get("status") in ("error",) or "proxyerror" in err_str or "connect" in err_str or "timeout" in err_str):
+        proxy_failure = any(
+            marker in err_str
+            for marker in (
+                "proxyerror",
+                "proxyconnectionerror",
+                "endpointconnectionerror",
+                "connecterror",
+                "connecttimeout",
+                "readtimeout",
+                "networkerror",
+            )
+        )
+        if proxy and proxy_failure:
             await get_pool().mark_dead(proxy)
             result.setdefault("extra", {})["proxy_dead"] = True
 
@@ -171,6 +222,8 @@ async def check_one_key(
         source = "bedrock_deep" if provider == "aws_bedrock" and mode == "bedrock_deep" else "checker"
         db.save_result(key_id, result, source=source)
         if job_id:
+            if provider != "aws_bedrock":
+                db.bump_job_detail(job_id, provider or "完成")
             db.bump_job(job_id)
 
 
@@ -304,7 +357,7 @@ async def import_keys(payload: ImportPayload):
     ids = db.upsert_keys(keys, providers)
     valid_ids = [i for i in ids if i is not None]
     concurrency = _effective_concurrency(payload.concurrency, "quick")
-    job_id = db.create_job(len(valid_ids), concurrency, mode="quick")
+    job_id = _create_check_job(valid_ids, concurrency, mode="quick")
     asyncio.create_task(
         run_job(
             valid_ids,
@@ -333,7 +386,7 @@ async def recheck_keys(payload: IdsPayload):
     for kid in key_ids:
         db.set_key_status(kid, "pending")
     concurrency = _effective_concurrency(payload.concurrency, payload.mode)
-    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    job_id = _create_check_job(key_ids, concurrency, mode=payload.mode)
     asyncio.create_task(
         run_job(
             key_ids,
@@ -376,17 +429,17 @@ async def get_keys(provider: str | None = None, status: str | None = None, tier:
     return {"keys": rows, "count": len(rows)}
 
 
+@app.get("/api/jobs/running", dependencies=[Depends(require_auth)])
+async def running_jobs():
+    return {"jobs": db.get_running_jobs()}
+
+
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(require_auth)])
 async def get_job(job_id: int):
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     return job
-
-
-@app.get("/api/jobs/running", dependencies=[Depends(require_auth)])
-async def running_jobs():
-    return {"jobs": db.get_running_jobs()}
 
 
 @app.post("/api/keys/export", dependencies=[Depends(require_auth)])
@@ -474,7 +527,7 @@ async def vault_recheck(payload: IdsPayload):
     for kid in key_ids:
         db.set_key_status(kid, "pending")
     concurrency = _effective_concurrency(payload.concurrency, payload.mode)
-    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    job_id = _create_check_job(key_ids, concurrency, mode=payload.mode)
     asyncio.create_task(
         run_job(
             key_ids,
@@ -560,12 +613,69 @@ def _audit_request(
     )
 
 
+_AWS_REGION_EXPORT_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
+
+
+def _bedrock_callable_regions(row: dict) -> list[str]:
+    """Read regions with a proven successful Bedrock runtime invocation."""
+    raw_extra = row.get("extra")
+    extra = raw_extra if isinstance(raw_extra, dict) else _parse_json_field(raw_extra)
+    if not isinstance(extra, dict):
+        return []
+
+    summary = extra.get("model_summary")
+    summary = summary if isinstance(summary, dict) else {}
+    values = summary.get("successful_regions")
+
+    # Compatibility fallback for older persisted results that recorded
+    # successful invocations but did not yet materialize the summary field.
+    if not isinstance(values, list) or not values:
+        region_results = extra.get("region_results")
+        if isinstance(region_results, dict):
+            values = [
+                region
+                for region, result in region_results.items()
+                if isinstance(result, dict)
+                and any(
+                    invocation.get("status") == "success"
+                    for invocation in result.get("invocations", [])
+                    if isinstance(invocation, dict)
+                )
+            ]
+
+    regions: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(values, list):
+        return regions
+    for value in values:
+        region = str(value).strip().lower()
+        if region in seen or not _AWS_REGION_EXPORT_RE.fullmatch(region):
+            continue
+        seen.add(region)
+        regions.append(region)
+    return regions
+
+
+def _secret_export_lines(row: dict) -> list[str]:
+    api_key = str(row.get("api_key") or "")
+    if row.get("provider") != "aws_bedrock":
+        return [api_key]
+
+    credentials = parse_bedrock_key(api_key)
+    regions = _bedrock_callable_regions(row)
+    if credentials is None or not regions:
+        return [api_key]
+    canonical_key = "|".join(credentials)
+    return [f"{canonical_key}|{region}" for region in regions]
+
+
 def _secret_export_response(rows: list[dict], format: str):
     if format == "json":
         return JSONResponse(rows)
     if format != "txt":
         raise HTTPException(400, "unsupported format")
-    return PlainTextResponse("\n".join(row["api_key"] for row in rows))
+    lines = [line for row in rows for line in _secret_export_lines(row)]
+    return PlainTextResponse("\n".join(lines))
 
 
 def _unit_price_to_minor(value: Decimal | None) -> int | None:
@@ -666,7 +776,7 @@ async def inventory_recheck(payload: IdsPayload):
     if not key_ids:
         return {"job_id": None, "queued": 0, "skipped": prepared["skipped"] + mode_skipped}
     concurrency = _effective_concurrency(payload.concurrency, payload.mode)
-    job_id = db.create_job(len(key_ids), concurrency, mode=payload.mode)
+    job_id = _create_check_job(key_ids, concurrency, mode=payload.mode)
     asyncio.create_task(
         run_job(
             key_ids,

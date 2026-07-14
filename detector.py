@@ -18,15 +18,18 @@ GEMINI_PATTERNS = [
 ]
 AWS_ACCESS_KEY_ID_PATTERN = re.compile(r"^AKIA[A-Z0-9]{16}$")
 AWS_SECRET_ACCESS_KEY_PATTERN = re.compile(r"^[A-Za-z0-9/+=]{40}$")
+AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
 
 
 def _aws_candidate_parts(key: str) -> tuple[str, str] | None:
     """Split a likely AWS credential without deciding whether it is supported."""
     normalized = unicodedata.normalize("NFKC", key)
     parts = normalized.split("|")
-    if len(parts) != 2:
+    if len(parts) not in (2, 3):
         return None
-    access_key_id, secret_access_key = (part.strip() for part in parts)
+    access_key_id, secret_access_key = (part.strip() for part in parts[:2])
+    if len(parts) == 3 and not AWS_REGION_PATTERN.fullmatch(parts[2].strip().lower()):
+        return None
     if not access_key_id.upper().startswith(("AKIA", "ASIA")):
         return None
     return access_key_id, secret_access_key
@@ -46,9 +49,11 @@ def _aws_display_access_key_id(key: str) -> str | None:
 def normalize_key(key: str) -> str:
     """Return the canonical storage form for a pasted API credential.
 
-    Non-AWS credentials are only stripped. AWS two-part credentials additionally
-    normalize compatibility characters and whitespace around the separator so
-    equivalent pasted values de-duplicate correctly.
+    Non-AWS credentials are only stripped. AWS credentials additionally
+    normalize compatibility characters and whitespace around the separator.
+    An optional third region field is discarded because Bedrock checks discover
+    regions themselves; this also de-duplicates one credential pasted once per
+    region.
     """
     stripped = key.strip()
     parts = _aws_candidate_parts(stripped)
@@ -61,7 +66,9 @@ def parse_bedrock_key(key: str) -> tuple[str, str] | None:
     """Parse a supported long-lived AWS access key pair.
 
     Temporary ``ASIA`` credentials intentionally remain unsupported because a
-    session token is required in addition to the two fields accepted here.
+    session token is required in addition to the fields accepted here. A valid
+    optional third field (``AccessKey|Secret|region``) is treated as a source
+    hint and deliberately ignored; the checker scans all configured regions.
     """
     parts = _aws_candidate_parts(key.strip())
     if parts is None:

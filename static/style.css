@@ -569,6 +569,10 @@ td {
 	background: var(--gray);
 	opacity: 0.55;
 }
+.chip.warn {
+	background: var(--yellow);
+	color: var(--ink);
+}
 .chip.aws-deep {
 	background: var(--aws-ink);
 	color: #fff;
