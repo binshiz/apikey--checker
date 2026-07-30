@@ -14,6 +14,7 @@
 	--border: 2.5px solid var(--ink);
 	--aws-orange: #ff9900;
 	--aws-ink: #232f3e;
+	--gcp-blue: #1a73e8;
 }
 
 * {
@@ -233,6 +234,50 @@ input[type="checkbox"] {
 	font-size: 13px;
 }
 
+.credential-file-import {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex-wrap: wrap;
+	margin-top: 14px;
+	padding: 12px;
+	border: 2px dashed var(--ink);
+	background: var(--gray);
+	border-radius: 3px;
+}
+.credential-file-label {
+	display: block;
+	width: 100%;
+	font-weight: 700;
+	font-size: 13px;
+}
+.credential-file-import input[type="file"] {
+	min-height: 44px;
+	max-width: min(100%, 480px);
+	padding: 7px;
+	border: var(--border);
+	background: var(--cream);
+	border-radius: 3px;
+	font-family: inherit;
+	cursor: pointer;
+}
+.credential-file-import input[type="file"]::file-selector-button {
+	min-height: 32px;
+	margin-right: 10px;
+	padding: 5px 10px;
+	border: 2px solid var(--ink);
+	background: #fff;
+	font-family: inherit;
+	font-weight: 700;
+	cursor: pointer;
+	box-shadow: 1.5px 1.5px 0 var(--ink);
+}
+.file-summary {
+	font-size: 12px;
+	font-weight: 700;
+	overflow-wrap: anywhere;
+}
+
 .btn {
 	background: #fff;
 	border: var(--border);
@@ -427,6 +472,10 @@ td {
 	background: #74aa9c;
 	color: var(--ink);
 }
+.badge.azure-openai {
+	background: #0078d4;
+	color: #fff;
+}
 .badge.anthropic {
 	background: #d97757;
 	color: var(--ink);
@@ -439,6 +488,14 @@ td {
 	background: var(--aws-ink);
 	color: #fff;
 	box-shadow: 1.5px 1.5px 0 var(--aws-orange);
+}
+.badge.gcp-service-account {
+	background: var(--gcp-blue);
+	color: #fff;
+}
+.badge.openrouter {
+	background: #5b5bd6;
+	color: #fff;
 }
 .badge.unknown {
 	background: var(--gray);
@@ -577,6 +634,17 @@ td {
 	background: var(--aws-ink);
 	color: #fff;
 	box-shadow: 1px 1px 0 var(--aws-orange);
+}
+.chip-action {
+	appearance: none;
+	font: inherit;
+	line-height: inherit;
+	cursor: copy;
+}
+.chip-action:hover,
+.chip-action:focus-visible {
+	transform: translate(-1px, -1px);
+	box-shadow: 2px 2px 0 var(--ink);
 }
 
 .key-cell.masked {
@@ -882,9 +950,17 @@ td {
 	}
 	input[type="number"],
 	input[type="text"],
+	input[type="file"],
 	select,
 	textarea {
 		font-size: 16px;
+	}
+	.credential-file-import {
+		align-items: stretch;
+	}
+	.credential-file-import input[type="file"] {
+		width: 100%;
+		max-width: none;
 	}
 	.modal {
 		align-items: flex-end;

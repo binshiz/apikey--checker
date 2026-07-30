@@ -6,3 +6,4 @@ python-multipart>=0.0.9
 pydantic>=2.6.0
 boto3>=1.35,<2
 PySocks>=1.7.1,<2
+google-auth[requests]>=2.40,<3

@@ -620,18 +620,40 @@ def _is_callable_valid_check(
     status: str | None,
     extra: dict | str | None,
 ) -> bool:
-    """Require runtime proof before a Bedrock result can enter formal stock."""
+    """Require runtime proof for providers whose discovery APIs over-report access."""
     if status != "valid":
         return False
-    if provider != "aws_bedrock":
+    if provider not in {
+        "aws_bedrock",
+        "azure_openai",
+        "gcp_service_account",
+        "openrouter",
+    }:
         return True
     if isinstance(extra, str):
         try:
             extra = json.loads(extra)
         except (TypeError, ValueError):
             return False
+    if provider == "gcp_service_account":
+        return (
+            isinstance(extra, dict)
+            and extra.get("token_exchange") == "success"
+            and extra.get("model_invocation_verification") == "success"
+            and isinstance(extra.get("supported_models"), list)
+            and bool(extra["supported_models"])
+        )
+    if provider == "openrouter":
+        return (
+            isinstance(extra, dict)
+            and extra.get("credential_status") == "valid"
+            and extra.get("invocation_verification") == "success"
+        )
     if not isinstance(extra, dict) or extra.get("invocation_verification") != "success":
         return False
+    if provider == "azure_openai":
+        verified_targets = extra.get("verified_callable_targets")
+        return isinstance(verified_targets, list) and bool(verified_targets)
     summary = extra.get("model_summary")
     return (
         isinstance(summary, dict)
@@ -653,7 +675,8 @@ _AWS_CREDENTIAL_PAIR = re.compile(
     r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\s*\|\s*[A-Za-z0-9/+=]{40,}(?=$|\s|[,;}])"
 )
 _COMMON_API_KEY = re.compile(
-    r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})\b"
+    r"\b(?:sk-or-v1-[a-f0-9]{64}|sk-(?:proj-)?[A-Za-z0-9_-]{16,}|"
+    r"sk-ant-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})\b"
 )
 
 

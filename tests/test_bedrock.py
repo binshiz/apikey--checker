@@ -7,12 +7,15 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 from checkers import bedrock
 
 
 ACCESS_KEY_ID = "AKIAABCDEFGHIJKLMNOP"
 SECRET_ACCESS_KEY = "a/+=" + "b" * 36
 KEY = f"{ACCESS_KEY_ID}|{SECRET_ACCESS_KEY}"
+BEDROCK_API_KEY = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "A" * 80 + "="
 
 
 class AwsError(Exception):
@@ -123,6 +126,90 @@ class BedrockCheckerTests(unittest.TestCase):
 
         return factory
 
+    def test_native_api_key_scans_supported_regions_without_invoking_models(self):
+        progress = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers["Authorization"], f"Bearer {BEDROCK_API_KEY}")
+            region = request.url.host.removeprefix("bedrock.").removesuffix(".amazonaws.com")
+            if region == "ap-south-2":
+                return httpx.Response(
+                    403,
+                    headers={"x-amzn-errortype": "AccessDeniedException"},
+                    json={"message": "denied"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "modelSummaries": [
+                        {"modelId": "amazon.nova-lite-v1:0"},
+                        {"modelId": f"anthropic.claude-{region}"},
+                    ]
+                },
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch.object(
+                bedrock,
+                "configured_api_key_regions",
+                return_value=("us-east-1", "ap-south-2", "eu-west-1"),
+            ),
+            patch.object(bedrock, "_new_bearer_client", return_value=client) as client_factory,
+            patch.object(bedrock, "_new_session", side_effect=AssertionError("SigV4 path used")),
+        ):
+            result = self.run_async(
+                bedrock.check(
+                    BEDROCK_API_KEY,
+                    proxy="socks5://127.0.0.1:1080",
+                    progress_callback=progress.append,
+                )
+            )
+
+        client_factory.assert_called_once_with("socks5://127.0.0.1:1080")
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["extra"]["credential_type"], "bedrock_api_key")
+        self.assertEqual(result["extra"]["credential_status"], "bedrock_verified")
+        self.assertEqual(result["extra"]["invocation_verification"], "not_attempted")
+        self.assertEqual(
+            result["extra"]["model_summary"]["authorized_regions"],
+            ["us-east-1", "eu-west-1"],
+        )
+        self.assertEqual(
+            result["extra"]["model_summary"]["denied_regions"],
+            ["ap-south-2"],
+        )
+        self.assertEqual(result["extra"]["model_summary"]["catalog_model_count"], 3)
+        self.assertEqual(progress, ["us-east-1", "ap-south-2", "eu-west-1"])
+        self.assertNotIn(BEDROCK_API_KEY, json.dumps(result))
+
+    def test_native_api_key_all_unauthorized_is_invalid(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                401,
+                headers={"x-amzn-errortype": "UnrecognizedClientException"},
+                json={"message": BEDROCK_API_KEY},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch.object(
+                bedrock,
+                "configured_api_key_regions",
+                return_value=("us-east-1", "us-west-2"),
+            ),
+            patch.object(bedrock, "_new_bearer_client", return_value=client),
+        ):
+            result = self.run_async(bedrock.deep_check(BEDROCK_API_KEY))
+
+        self.assertEqual(result["status"], "invalid")
+        self.assertEqual(result["extra"]["credential_status"], "invalid")
+        self.assertEqual(
+            result["extra"]["model_summary"]["invalid_regions"],
+            ["us-east-1", "us-west-2"],
+        )
+        self.assertNotIn(BEDROCK_API_KEY, json.dumps(result))
+
     def test_quick_check_paginates_selects_latest_and_stops_early(self):
         opus4 = "us.anthropic.claude-opus-4-20250514-v1:0"
         opus48 = "us.anthropic.claude-opus-4-8-20260701-v1:0"
@@ -181,6 +268,299 @@ class BedrockCheckerTests(unittest.TestCase):
         self.assertEqual(result["status"], "invalid")
         self.assertEqual(result["extra"]["credential_status"], "invalid")
         self.assertEqual(result["extra"]["regions_checked"], [])
+
+    def test_quick_check_prioritizes_and_confirms_claude_fable_5(self):
+        fable = "global.anthropic.claude-fable-5"
+        opus = "us.anthropic.claude-opus-4-8-v1:0"
+        runtime = RuntimeClient({fable: {}})
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": ProfileClient({None: profile_page(opus, fable)}),
+            "bedrock-runtime": runtime,
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.check(KEY))
+
+        fable_summary = result["extra"]["model_summary"]["fable_5"]
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual([call["modelId"] for call in runtime.calls], [fable])
+        self.assertEqual(json.loads(runtime.calls[0]["body"]), bedrock._FABLE_5_INVOKE_BODY)
+        self.assertEqual(fable_summary["status"], "supported")
+        self.assertIs(fable_summary["supported"], True)
+        self.assertEqual(fable_summary["successful_models"], [fable])
+        self.assertEqual(fable_summary["successful_regions"], ["us-east-1"])
+        self.assertIs(result["extra"]["has_claude_fable_5"], True)
+        self.assertEqual(result["extra"]["fable_5_status"], "supported")
+        self.assertEqual(result["extra"]["model_summary"]["opus_versions"], ["4.8"])
+        self.assertEqual(
+            result["extra"]["gateway_mapping"],
+            {"claude-fable-5": fable},
+        )
+        self.assertEqual(
+            result["extra"]["gateway_mappings_by_region"],
+            {"us-east-1": {"claude-fable-5": fable}},
+        )
+        self.assertEqual(
+            result["extra"]["gateway_primary_model"],
+            "claude-fable-5",
+        )
+        self.assertEqual(
+            result["extra"]["gateway_primary_regions"],
+            ["us-east-1"],
+        )
+        self.assertEqual(
+            result["extra"]["gateway_region_groups"],
+            [{
+                "kind": "fable_5",
+                "regions": ["us-east-1"],
+                "mapping": {"claude-fable-5": fable},
+            }],
+        )
+
+    def test_gateway_mapping_uses_only_successes_and_prefers_global_routes(self):
+        global_opus = "global.anthropic.claude-opus-4-6-v1"
+        regional_opus = "us.anthropic.claude-opus-4-6-v1"
+        regional_new_opus = "us.anthropic.claude-opus-4-7"
+        global_new_opus = "global.anthropic.claude-opus-4-7"
+        fable = "us.anthropic.claude-fable-5"
+        mapping, by_region = bedrock.build_gateway_mappings({
+            "us-east-1": {
+                "invocations": [
+                    {"model_id": regional_opus, "status": "success"},
+                    {"model_id": regional_new_opus, "status": "success"},
+                    {"model_id": global_new_opus, "status": "error"},
+                    {"model_id": fable, "status": "success"},
+                    {
+                        "model_id": "global.anthropic.claude-opus-4-8",
+                        "status": "throttled",
+                    },
+                ],
+            },
+            "eu-west-1": {
+                "invocations": [
+                    {"model_id": global_opus, "status": "success"},
+                ],
+            },
+        })
+
+        self.assertEqual(mapping, {
+            "claude-fable-5": fable,
+            "claude-opus-4-6": global_opus,
+            "claude-opus-4-7": regional_new_opus,
+        })
+        self.assertNotIn("claude-opus-4-8", mapping)
+        self.assertEqual(by_region, {
+            "eu-west-1": {
+                "claude-opus-4-6": global_opus,
+            },
+            "us-east-1": {
+                "claude-fable-5": fable,
+                "claude-opus-4-6": regional_opus,
+                "claude-opus-4-7": regional_new_opus,
+            },
+        })
+        self.assertEqual(
+            bedrock.select_gateway_primary_model(by_region),
+            ("claude-fable-5", ["us-east-1"]),
+        )
+        self.assertEqual(
+            bedrock.build_gateway_region_groups(by_region),
+            [
+                {
+                    "kind": "fable_5",
+                    "regions": ["us-east-1"],
+                    "mapping": {
+                        "claude-fable-5": fable,
+                        "claude-opus-4-6": regional_opus,
+                        "claude-opus-4-7": regional_new_opus,
+                    },
+                },
+                {
+                    "kind": "other_models",
+                    "regions": ["eu-west-1"],
+                    "mapping": {
+                        "claude-opus-4-6": global_opus,
+                    },
+                },
+            ],
+        )
+
+    def test_common_gateway_mapping_requires_same_target_in_every_region(self):
+        by_region = {
+            "us-east-1": {
+                "claude-fable-5": "us.anthropic.claude-fable-5",
+                "claude-opus-4-8": "global.anthropic.claude-opus-4-8",
+            },
+            "us-west-2": {
+                "claude-fable-5": "us.anthropic.claude-fable-5",
+                "claude-opus-4-8": "us.anthropic.claude-opus-4-8",
+            },
+        }
+
+        self.assertEqual(
+            bedrock.build_common_gateway_mapping(
+                by_region,
+                ["us-east-1", "us-west-2"],
+            ),
+            {"claude-fable-5": "us.anthropic.claude-fable-5"},
+        )
+
+    def test_incompatible_regions_are_partitioned_into_route_groups(self):
+        by_region = {
+            "ap-northeast-1": {
+                "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
+            },
+            "eu-west-1": {
+                "claude-opus-4-6": "eu.anthropic.claude-opus-4-6-v1",
+            },
+        }
+
+        self.assertEqual(
+            bedrock.build_gateway_region_groups(by_region),
+            [{
+                "kind": "other_models",
+                "regions": ["ap-northeast-1", "eu-west-1"],
+                "mapping": {},
+                "route_groups": [
+                    {
+                        "regions": ["ap-northeast-1"],
+                        "mapping": {
+                            "claude-opus-4-6":
+                                "global.anthropic.claude-opus-4-6-v1",
+                        },
+                    },
+                    {
+                        "regions": ["eu-west-1"],
+                        "mapping": {
+                            "claude-opus-4-6":
+                                "eu.anthropic.claude-opus-4-6-v1",
+                        },
+                    },
+                ],
+            }],
+        )
+
+    def test_gateway_primary_falls_back_to_newest_successful_opus(self):
+        by_region = {
+            "us-east-1": {
+                "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
+            },
+            "us-east-2": {
+                "claude-opus-4-8": "global.anthropic.claude-opus-4-8",
+            },
+            "us-west-2": {
+                "claude-opus-4-8": "us.anthropic.claude-opus-4-8",
+            },
+        }
+
+        self.assertEqual(
+            bedrock.select_gateway_primary_model(by_region),
+            ("claude-opus-4-8", ["us-east-2", "us-west-2"]),
+        )
+
+    def test_quick_check_falls_back_between_fable_5_routes(self):
+        regional_fable = "us.anthropic.claude-fable-5"
+        global_fable = "global.anthropic.claude-fable-5"
+        runtime = RuntimeClient({
+            regional_fable: AwsError("AccessDeniedException"),
+            global_fable: {},
+        })
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": ProfileClient({None: profile_page(global_fable, regional_fable)}),
+            "bedrock-runtime": runtime,
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.check(KEY))
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(
+            [call["modelId"] for call in runtime.calls],
+            [regional_fable, global_fable],
+        )
+        self.assertEqual(result["extra"]["fable_5_status"], "supported")
+
+    def test_invoke_only_iam_can_confirm_fable_without_list_permissions(self):
+        fable = "anthropic.claude-fable-5"
+        access_denied = AwsError("AccessDeniedException")
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": ProfileClient(
+                {None: access_denied},
+                foundation_error=access_denied,
+            ),
+            "bedrock-runtime": RuntimeClient({fable: {}}),
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.check(KEY))
+
+        summary = result["extra"]["model_summary"]
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["extra"]["fable_5_status"], "supported")
+        self.assertEqual(summary["fable_5"]["discovered_models"], [])
+        self.assertEqual(summary["fable_5"]["successful_models"], [fable])
+
+    def test_fable_data_retention_requirement_is_distinct_from_opus_access(self):
+        fable = "us.anthropic.claude-fable-5"
+        opus = "us.anthropic.claude-opus-4-8-v1:0"
+        runtime = RuntimeClient({
+            fable: AwsError(
+                "ValidationException",
+                "Set data retention mode to provider_data_share before invoking this model",
+            ),
+            opus: {},
+        })
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": ProfileClient({None: profile_page(opus, fable)}),
+            "bedrock-runtime": runtime,
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.check(KEY))
+
+        fable_summary = result["extra"]["model_summary"]["fable_5"]
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual([call["modelId"] for call in runtime.calls], [fable, opus])
+        self.assertEqual(fable_summary["status"], "data_retention_required")
+        self.assertIs(fable_summary["supported"], False)
+        self.assertTrue(fable_summary["data_retention_required"])
+        self.assertNotIn("Set data retention", json.dumps(result))
+
+    def test_fable_throttle_confirms_model_support(self):
+        fable = "global.anthropic.claude-fable-5"
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": ProfileClient({None: profile_page(fable)}),
+            "bedrock-runtime": RuntimeClient({fable: AwsError("ThrottlingException")}),
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.check(KEY))
+
+        fable_summary = result["extra"]["model_summary"]["fable_5"]
+        self.assertEqual(result["status"], "no_quota")
+        self.assertEqual(fable_summary["status"], "throttled")
+        self.assertIs(fable_summary["supported"], True)
+        self.assertEqual(fable_summary["throttled_regions"], ["us-east-1"])
 
     def test_quick_check_falls_back_to_an_older_opus_version(self):
         opus48 = "us.anthropic.claude-opus-4-8-v1:0"
@@ -559,6 +939,48 @@ class BedrockCheckerTests(unittest.TestCase):
             {call["modelId"] for call in session.services["bedrock-runtime"].calls},
             {base_model_id, profile_id},
         )
+        self.assertNotIn("sonnet", json.dumps(result).lower())
+
+    def test_deep_check_discovers_fable_5_as_a_foundation_model(self):
+        fable = "anthropic.claude-fable-5"
+        bedrock_client = ProfileClient(
+            {None: profile_page()},
+            foundation_models=[
+                {
+                    "modelId": fable,
+                    "modelName": "Claude Fable 5",
+                    "providerName": "Anthropic",
+                },
+                {
+                    "modelId": "anthropic.claude-sonnet-5",
+                    "modelName": "Claude Sonnet 5",
+                    "providerName": "Anthropic",
+                },
+            ],
+        )
+        runtime = RuntimeClient({fable: {}})
+        session = FakeSession({
+            "sts": StsClient(),
+            "bedrock": bedrock_client,
+            "bedrock-runtime": runtime,
+            "service-quotas": QuotaClient(pages=[{"Quotas": [{
+                "QuotaName": "Claude Fable 5 global requests per minute",
+                "Value": 20,
+            }]}]),
+        })
+
+        with (
+            patch.object(bedrock, "configured_regions", return_value=("us-east-1",)),
+            patch.object(bedrock, "_new_session", return_value=session),
+        ):
+            result = self.run_async(bedrock.deep_check(KEY))
+
+        summary = result["extra"]["model_summary"]
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(summary["supported_models"], [fable])
+        self.assertEqual(summary["fable_5"]["status"], "supported")
+        self.assertEqual([call["modelId"] for call in runtime.calls], [fable])
+        self.assertEqual(result["extra"]["quotas"]["us-east-1"]["fable-5"]["global"]["rpm"], 20)
         self.assertNotIn("sonnet", json.dumps(result).lower())
 
     def test_deep_region_concurrency_never_exceeds_three(self):

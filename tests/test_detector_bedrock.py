@@ -1,13 +1,40 @@
 import unittest
 
-from detector import detect_provider, normalize_key, parse_bedrock_key, short_key
+from detector import (
+    detect_provider,
+    normalize_key,
+    parse_bedrock_api_key,
+    parse_bedrock_key,
+    short_key,
+)
 
 
 ACCESS_KEY_ID = "AKIAABCDEFGHIJKLMNOP"
 SECRET_ACCESS_KEY = "a/+=" + "b" * 36
+BEDROCK_API_KEY = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "A" * 80 + "="
 
 
 class BedrockDetectorTests(unittest.TestCase):
+    def test_detects_native_bedrock_api_key_and_discards_region_suffix(self):
+        pasted = f"  {BEDROCK_API_KEY}｜us-east-1  "
+
+        self.assertEqual(normalize_key(pasted), BEDROCK_API_KEY)
+        self.assertEqual(parse_bedrock_api_key(pasted), BEDROCK_API_KEY)
+        self.assertEqual(detect_provider(pasted), "aws_bedrock")
+
+    def test_rejects_malformed_native_bedrock_api_key(self):
+        self.assertIsNone(parse_bedrock_api_key("ABSKtoo-short"))
+        self.assertIsNone(detect_provider(f"{BEDROCK_API_KEY}|not-a-region"))
+        self.assertIsNone(detect_provider(f"{BEDROCK_API_KEY}|us-east-1|extra"))
+        self.assertIsNone(detect_provider(BEDROCK_API_KEY.replace("ABSK", "absk", 1)))
+
+    def test_short_native_bedrock_api_key_is_masked(self):
+        display = short_key(BEDROCK_API_KEY)
+
+        self.assertTrue(display.startswith(BEDROCK_API_KEY[:8]))
+        self.assertTrue(display.endswith(BEDROCK_API_KEY[-5:]))
+        self.assertNotIn(BEDROCK_API_KEY, display)
+
     def test_detects_and_normalizes_long_lived_aws_pair(self):
         pasted = f"  {ACCESS_KEY_ID}   |   {SECRET_ACCESS_KEY}  "
 

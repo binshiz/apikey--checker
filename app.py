@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db
 
@@ -32,27 +32,68 @@ def require_auth(request: Request):
     token = request.headers.get("X-Admin-Key", "")
     if token != ADMIN_KEY:
         raise HTTPException(401, "unauthorized")
-from detector import detect_provider, normalize_key, parse_bedrock_key, short_key
+from detector import (
+    azure_openai_chat_completions_url,
+    canonicalize_gcp_service_account,
+    detect_provider,
+    normalize_key,
+    parse_azure_openai_key,
+    parse_bedrock_api_key,
+    parse_bedrock_key,
+    parse_gcp_service_account,
+    short_key,
+)
 from checkers import openai as openai_checker
+from checkers import azure_openai as azure_openai_checker
 from checkers import anthropic as anthropic_checker
 from checkers import gemini as gemini_checker
 from checkers import bedrock as bedrock_checker
+from checkers import gcp_service_account as gcp_service_account_checker
+from checkers import openrouter as openrouter_checker
 from proxy_pool import get_pool, ProxyPool
 
 
 CHECKERS = {
     "openai": openai_checker.check,
+    "azure_openai": azure_openai_checker.check,
     "anthropic": anthropic_checker.check,
     "gemini": gemini_checker.check,
     "aws_bedrock": bedrock_checker.check,
+    "gcp_service_account": gcp_service_account_checker.check,
+    "openrouter": openrouter_checker.check,
 }
 
 CHECKER_SUPPORTS_PROXY = {
     "openai": True,
+    "azure_openai": True,
     "anthropic": True,
     "gemini": True,
     "aws_bedrock": True,
+    "gcp_service_account": True,
+    "openrouter": True,
 }
+
+
+def _with_bedrock_gateway_metadata(provider: str | None, extra: Any) -> Any:
+    """Materialize mappings for older results without requiring another paid check."""
+    if provider != "aws_bedrock" or not isinstance(extra, dict):
+        return extra
+    mapping, by_region = bedrock_checker.build_gateway_mappings(
+        extra.get("region_results")
+    )
+    if mapping:
+        extra["gateway_mapping"] = mapping
+        extra["gateway_mappings_by_region"] = by_region
+        extra["gateway_mapping_basis"] = "invoke_model_success"
+        (
+            extra["gateway_primary_model"],
+            extra["gateway_primary_regions"],
+        ) = bedrock_checker.select_gateway_primary_model(by_region)
+        extra["gateway_region_groups"] = (
+            bedrock_checker.build_gateway_region_groups(by_region)
+        )
+    return extra
+
 
 CheckMode = Literal["quick", "bedrock_deep"]
 
@@ -116,11 +157,16 @@ def _create_check_job(
     concurrency: int,
     mode: CheckMode,
 ) -> int:
-    region_steps = len(bedrock_checker.configured_regions()) + 1
     detail_total = 0
     for key_id in key_ids:
         info = db.get_key(key_id)
-        detail_total += region_steps if info and info.get("provider") == "aws_bedrock" else 1
+        if info and info.get("provider") == "aws_bedrock":
+            if parse_bedrock_api_key(info.get("api_key") or "") is not None:
+                detail_total += len(bedrock_checker.configured_api_key_regions())
+            else:
+                detail_total += len(bedrock_checker.configured_regions()) + 1
+        else:
+            detail_total += 1
     return db.create_job(
         len(key_ids),
         concurrency,
@@ -243,10 +289,70 @@ async def run_job(
     db.finish_job(job_id)
 
 
+MAX_GCP_SERVICE_ACCOUNT_FILES = 100
+
+
+def _gcp_credentials_from_json(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        documents = [value]
+    elif isinstance(value, list):
+        if len(value) > MAX_GCP_SERVICE_ACCOUNT_FILES:
+            raise ValueError("at most 100 GCP service account credentials are allowed")
+        documents = value
+    else:
+        raise ValueError("GCP service account input must be a JSON object or array")
+
+    credentials = []
+    for index, document in enumerate(documents, start=1):
+        if not isinstance(document, dict):
+            raise ValueError(f"GCP service account item {index} must be a JSON object")
+        try:
+            credentials.append(canonicalize_gcp_service_account(document))
+        except ValueError as exc:
+            raise ValueError(f"GCP service account item {index}: {exc}") from exc
+    return credentials
+
+
 def _parse_keys_text(text: str) -> tuple[list[str], dict[str, str | None]]:
     keys = []
     providers = {}
+    stripped_text = text.strip()
+    if stripped_text.startswith(("{", "[")):
+        try:
+            json_value = json.loads(stripped_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid pasted GCP service account JSON") from exc
+        for credential in _gcp_credentials_from_json(json_value):
+            if credential in providers:
+                continue
+            providers[credential] = "gcp_service_account"
+            keys.append(credential)
+        return keys, providers
+
+    azure_env: dict[str, dict[str, str]] = {}
+    ordinary_lines = []
     for line in text.splitlines():
+        stripped = line.strip()
+        env_match = re.fullmatch(
+            r"([A-Za-z][A-Za-z0-9_]*)_(KEY|ENDPOINT)\s*=\s*(.+)",
+            stripped,
+            re.IGNORECASE,
+        )
+        if env_match:
+            prefix, kind, value = env_match.groups()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1].strip()
+            azure_env.setdefault(prefix.upper(), {})[kind.upper()] = value
+            continue
+        ordinary_lines.append(line)
+
+    for values in azure_env.values():
+        if not values.get("ENDPOINT") or not values.get("KEY"):
+            continue
+        ordinary_lines.append(f'{values["ENDPOINT"]}|{values["KEY"]}')
+
+    for line in ordinary_lines:
         s = normalize_key(line)
         if not s or s.startswith("#"):
             continue
@@ -255,6 +361,21 @@ def _parse_keys_text(text: str) -> tuple[list[str], dict[str, str | None]]:
         prov = detect_provider(s)
         providers[s] = prov
         keys.append(s)
+    return keys, providers
+
+
+def _parse_import_credentials(
+    text: str,
+    service_accounts: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, str | None]]:
+    if len(service_accounts) > MAX_GCP_SERVICE_ACCOUNT_FILES:
+        raise ValueError("at most 100 GCP service account files are allowed")
+    keys, providers = _parse_keys_text(text)
+    for credential in _gcp_credentials_from_json(service_accounts):
+        if credential in providers:
+            continue
+        providers[credential] = "gcp_service_account"
+        keys.append(credential)
     return keys, providers
 
 
@@ -280,7 +401,8 @@ def _effective_concurrency(requested: int, mode: CheckMode) -> int:
 # ────────────────────────────────────────────────────────────────────
 
 class ImportPayload(BaseModel):
-    text: str
+    text: str = ""
+    service_accounts: list[dict[str, Any]] = Field(default_factory=list)
     concurrency: int = 4
     use_proxy: bool = False
 
@@ -350,7 +472,13 @@ async def auth_check(request: Request):
 
 @app.post("/api/keys/import", dependencies=[Depends(require_auth)])
 async def import_keys(payload: ImportPayload):
-    keys, providers = _parse_keys_text(payload.text)
+    try:
+        keys, providers = _parse_import_credentials(
+            payload.text,
+            payload.service_accounts,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not keys:
         raise HTTPException(400, "no keys found")
 
@@ -422,7 +550,10 @@ async def get_keys(provider: str | None = None, status: str | None = None, tier:
                 r["extra"] = {}
         else:
             r["extra"] = {}
-        r["extra"] = _sanitize_result_extra(r["extra"])
+        r["extra"] = _with_bedrock_gateway_metadata(
+            r.get("provider"),
+            _sanitize_result_extra(r["extra"]),
+        )
         r["error"] = _redact_proxy_urls(r.get("error"))
         api_key = r.pop("api_key", "")
         r["api_key_short"] = short_key(api_key)
@@ -483,7 +614,10 @@ async def vault_list(
                 r["extra"] = {}
         else:
             r["extra"] = {}
-        r["extra"] = _sanitize_result_extra(r["extra"])
+        r["extra"] = _with_bedrock_gateway_metadata(
+            r.get("provider"),
+            _sanitize_result_extra(r["extra"]),
+        )
         api_key = r.pop("api_key", "")
         r["api_key_short"] = short_key(api_key)
     return {"keys": rows, "count": len(rows), "stats": db.vault_stats()}
@@ -616,8 +750,12 @@ def _audit_request(
 _AWS_REGION_EXPORT_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
 
 
-def _bedrock_callable_regions(row: dict) -> list[str]:
-    """Read regions with a proven successful Bedrock runtime invocation."""
+def _bedrock_export_regions(row: dict) -> list[str]:
+    """Read verified regions for the row's specific Bedrock credential type.
+
+    SigV4 exports list Fable 5 regions first, then regions where another Claude
+    model was successfully invoked.
+    """
     raw_extra = row.get("extra")
     extra = raw_extra if isinstance(raw_extra, dict) else _parse_json_field(raw_extra)
     if not isinstance(extra, dict):
@@ -625,11 +763,34 @@ def _bedrock_callable_regions(row: dict) -> list[str]:
 
     summary = extra.get("model_summary")
     summary = summary if isinstance(summary, dict) else {}
-    values = summary.get("successful_regions")
+    api_key = str(row.get("api_key") or "")
+    is_bearer_api_key = parse_bedrock_api_key(api_key) is not None
+    if is_bearer_api_key:
+        values = summary.get("authorized_regions")
+    else:
+        _, by_region, _, _ = _bedrock_gateway_support(row)
+        groups = bedrock_checker.build_gateway_region_groups(by_region)
+        values = [
+            region
+            for group in groups
+            for region in group["regions"]
+        ]
+        if not values:
+            fable_summary = summary.get("fable_5")
+            fable_regions = (
+                fable_summary.get("successful_regions")
+                if isinstance(fable_summary, dict)
+                else None
+            )
+            values = (
+                fable_regions
+                if isinstance(fable_regions, list) and fable_regions
+                else summary.get("successful_regions")
+            )
 
     # Compatibility fallback for older persisted results that recorded
     # successful invocations but did not yet materialize the summary field.
-    if not isinstance(values, list) or not values:
+    if not is_bearer_api_key and (not isinstance(values, list) or not values):
         region_results = extra.get("region_results")
         if isinstance(region_results, dict):
             values = [
@@ -658,20 +819,145 @@ def _bedrock_callable_regions(row: dict) -> list[str]:
 
 def _secret_export_lines(row: dict) -> list[str]:
     api_key = str(row.get("api_key") or "")
+    if row.get("provider") == "gcp_service_account":
+        credential = parse_gcp_service_account(api_key)
+        if credential is not None:
+            return [canonicalize_gcp_service_account(credential)]
+    if row.get("provider") == "azure_openai":
+        azure_credential = parse_azure_openai_key(api_key)
+        if azure_credential is not None:
+            endpoint, secret = azure_credential
+            url = azure_openai_chat_completions_url(endpoint)
+            if url:
+                return [f"{url}|{secret}"]
     if row.get("provider") != "aws_bedrock":
         return [api_key]
 
+    bearer_api_key = parse_bedrock_api_key(api_key)
+    regions = _bedrock_export_regions(row)
+    if bearer_api_key is not None:
+        if not regions:
+            return [bearer_api_key]
+        return [f"{bearer_api_key}|{region}" for region in regions]
+
     credentials = parse_bedrock_key(api_key)
-    regions = _bedrock_callable_regions(row)
     if credentials is None or not regions:
         return [api_key]
     canonical_key = "|".join(credentials)
     return [f"{canonical_key}|{region}" for region in regions]
 
 
+def _bedrock_gateway_support(
+    row: dict,
+) -> tuple[dict[str, str], dict[str, dict[str, str]], str | None, list[str]]:
+    """Return sanitized overall and per-region runtime-proven model support."""
+    if row.get("provider") != "aws_bedrock":
+        return {}, {}, None, []
+    raw_extra = row.get("extra")
+    extra = raw_extra if isinstance(raw_extra, dict) else _parse_json_field(raw_extra)
+    if not isinstance(extra, dict):
+        return {}, {}, None, []
+
+    mapping, by_region = bedrock_checker.build_gateway_mappings(
+        extra.get("region_results")
+    )
+
+    def safe_mapping(value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        sanitized: dict[str, str] = {}
+        for alias, target in value.items():
+            alias_value = str(alias).strip().lower()
+            target_value = str(target).strip()
+            if (
+                re.fullmatch(
+                    r"claude-(?:fable|opus)-[a-z0-9]+(?:-[a-z0-9]+)*",
+                    alias_value,
+                )
+                and bedrock_checker.gateway_model_alias(target_value) == alias_value
+            ):
+                sanitized[alias_value] = target_value
+        return dict(sorted(sanitized.items()))
+
+    # Compatibility for compacted records that retain generated mappings but
+    # no longer carry every invocation result.
+    if not mapping:
+        mapping = safe_mapping(extra.get("gateway_mapping"))
+    if not by_region:
+        stored_by_region = extra.get("gateway_mappings_by_region")
+        if isinstance(stored_by_region, dict):
+            for raw_region, raw_mapping in stored_by_region.items():
+                region = str(raw_region).strip().lower()
+                region_mapping = safe_mapping(raw_mapping)
+                if (
+                    _AWS_REGION_EXPORT_RE.fullmatch(region)
+                    and region_mapping
+                ):
+                    by_region[region] = region_mapping
+
+    primary_model, primary_regions = (
+        bedrock_checker.select_gateway_primary_model(by_region)
+    )
+    return mapping, dict(sorted(by_region.items())), primary_model, primary_regions
+
+
+def _bedrock_gateway_mapping(row: dict) -> dict[str, str]:
+    """Return only model routes proven by successful Bedrock runtime calls."""
+    mapping, _, _, _ = _bedrock_gateway_support(row)
+    return mapping
+
+
+def _secret_export_bundle_block(row: dict) -> str:
+    key_text = "\n".join(_secret_export_lines(row))
+    mapping, by_region, _, _ = _bedrock_gateway_support(row)
+    if not mapping:
+        return key_text
+
+    # Group Fable 5 regions before all other callable regions. Each JSON object
+    # contains only alias/target pairs proven identically across every
+    # credential line immediately above it.
+    if (
+        row.get("provider") == "aws_bedrock"
+        and parse_bedrock_api_key(str(row.get("api_key") or "")) is None
+        and parse_bedrock_key(str(row.get("api_key") or "")) is not None
+        and by_region
+    ):
+        credentials = parse_bedrock_key(str(row.get("api_key") or ""))
+        canonical_key = "|".join(credentials) if credentials else ""
+        groups = bedrock_checker.build_gateway_region_groups(by_region)
+        blocks: list[str] = []
+        for group in groups:
+            regions = group["regions"]
+            region_mapping = group["mapping"]
+            credential_lines = [
+                f"{canonical_key}|{region}"
+                for region in regions
+            ]
+            credential_text = "\n".join(credential_lines)
+            mapping_payload: dict | list = region_mapping
+            if not region_mapping and group.get("route_groups"):
+                mapping_payload = {
+                    "route_groups": group["route_groups"],
+                }
+            mapping_json = json.dumps(
+                mapping_payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+            blocks.append(f"{credential_text}\n\n{mapping_json}")
+        if blocks:
+            return "\n\n".join(blocks)
+
+    mapping_json = json.dumps(mapping, ensure_ascii=False, indent=2)
+    return f"{key_text}\n\n{mapping_json}"
+
+
 def _secret_export_response(rows: list[dict], format: str):
     if format == "json":
         return JSONResponse(rows)
+    if format == "bundle":
+        blocks = [_secret_export_bundle_block(row) for row in rows]
+        return PlainTextResponse("\n\n".join(blocks))
     if format != "txt":
         raise HTTPException(400, "unsupported format")
     lines = [line for row in rows for line in _secret_export_lines(row)]
@@ -702,7 +988,10 @@ def _parse_json_field(value: str | None) -> Any:
 
 
 def _safe_inventory_row(row: dict, *, include_full_key: bool = False) -> dict:
-    row["extra"] = _sanitize_result_extra(_parse_json_field(row.get("extra")))
+    row["extra"] = _with_bedrock_gateway_metadata(
+        row.get("provider"),
+        _sanitize_result_extra(_parse_json_field(row.get("extra"))),
+    )
     row["error"] = _redact_proxy_urls(row.get("error"))
     row["api_key_short"] = short_key(row.get("api_key") or "")
     if not include_full_key:
@@ -711,7 +1000,10 @@ def _safe_inventory_row(row: dict, *, include_full_key: bool = False) -> dict:
 
 
 def _safe_check_run(row: dict) -> dict:
-    row["extra"] = _sanitize_result_extra(_parse_json_field(row.get("extra")))
+    row["extra"] = _with_bedrock_gateway_metadata(
+        row.get("provider"),
+        _sanitize_result_extra(_parse_json_field(row.get("extra"))),
+    )
     row["error"] = _redact_proxy_urls(row.get("error"))
     row.pop("proxy", None)
     return row

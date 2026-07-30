@@ -195,6 +195,50 @@ class AppSalesSecurityTests(unittest.TestCase):
                 "error": None,
                 "extra": {
                     "invocation_verification": "success",
+                    "region_results": {
+                        "us-east-1": {
+                            "invocations": [
+                                {
+                                    "model_id": "global.anthropic.claude-opus-4-8",
+                                    "family": "opus",
+                                    "version": "4.8",
+                                    "status": "success",
+                                },
+                                {
+                                    "model_id": "us.anthropic.claude-fable-5",
+                                    "family": "fable",
+                                    "version": "5",
+                                    "status": "success",
+                                },
+                            ],
+                        },
+                        "us-east-2": {
+                            "invocations": [
+                                {
+                                    "model_id": "global.anthropic.claude-opus-4-8",
+                                    "family": "opus",
+                                    "version": "4.8",
+                                    "status": "success",
+                                },
+                            ],
+                        },
+                        "us-west-2": {
+                            "invocations": [
+                                {
+                                    "model_id": "us.anthropic.claude-fable-5",
+                                    "family": "fable",
+                                    "version": "5",
+                                    "status": "success",
+                                },
+                                {
+                                    "model_id": "us.anthropic.claude-opus-4-7",
+                                    "family": "opus",
+                                    "version": "4.7",
+                                    "status": "success",
+                                },
+                            ],
+                        },
+                    },
                     "model_summary": {
                         "supported_regions": [
                             "us-east-1",
@@ -204,6 +248,7 @@ class AppSalesSecurityTests(unittest.TestCase):
                         "successful_regions": [
                             "us-east-1",
                             "US-EAST-2",
+                            "us-west-2",
                             "us-east-1",
                             "invalid region\nunsafe",
                         ],
@@ -219,6 +264,7 @@ class AppSalesSecurityTests(unittest.TestCase):
         inventory = next(row for row in db.list_inventory() if row["api_key"] == api_key)
         expected = "\n".join([
             f"{api_key}|us-east-1",
+            f"{api_key}|us-west-2",
             f"{api_key}|us-east-2",
         ])
 
@@ -236,6 +282,31 @@ class AppSalesSecurityTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.text, expected)
 
+        fable_group_mapping = {
+            "claude-fable-5": "us.anthropic.claude-fable-5",
+        }
+        other_group_mapping = {
+            "claude-opus-4-8": "global.anthropic.claude-opus-4-8",
+        }
+        bundle = self.client.post(
+            "/api/keys/export",
+            headers=self.headers,
+            json={"ids": [key_id], "format": "bundle"},
+        )
+        self.assertEqual(bundle.status_code, 200, bundle.text)
+        self.assertEqual(
+            bundle.text,
+            "\n\n".join([
+                "\n".join([
+                    f"{api_key}|us-east-1",
+                    f"{api_key}|us-west-2",
+                ]),
+                json.dumps(fable_group_mapping, indent=2),
+                f"{api_key}|us-east-2",
+                json.dumps(other_group_mapping, indent=2),
+            ]),
+        )
+
         json_export = self.client.post(
             "/api/inventory/export",
             headers=self.headers,
@@ -243,6 +314,89 @@ class AppSalesSecurityTests(unittest.TestCase):
         )
         self.assertEqual(json_export.status_code, 200, json_export.text)
         self.assertEqual(json_export.json()[0]["api_key"], api_key)
+        self.assertEqual(
+            json_export.json()[0]["extra"]["gateway_primary_model"],
+            "claude-fable-5",
+        )
+        self.assertEqual(
+            json_export.json()[0]["extra"]["gateway_primary_regions"],
+            ["us-east-1", "us-west-2"],
+        )
+        self.assertEqual(
+            json_export.json()[0]["extra"]["gateway_region_groups"],
+            [
+                {
+                    "kind": "fable_5",
+                    "regions": ["us-east-1", "us-west-2"],
+                    "mapping": fable_group_mapping,
+                },
+                {
+                    "kind": "other_models",
+                    "regions": ["us-east-2"],
+                    "mapping": other_group_mapping,
+                },
+            ],
+        )
+
+    def test_native_bedrock_api_key_export_expands_authorized_regions(self):
+        api_key = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "A" * 80 + "="
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        db.save_result(
+            key_id,
+            {
+                "status": "valid",
+                "tier": None,
+                "rpm": None,
+                "tpm": None,
+                "error": None,
+                "extra": {
+                    "credential_type": "bedrock_api_key",
+                    "invocation_verification": "not_attempted",
+                    "model_summary": {
+                        "authorized_regions": [
+                            "us-east-1",
+                            "EU-WEST-1",
+                            "us-east-1",
+                            "invalid region\nunsafe",
+                        ],
+                        "successful_regions": [],
+                    },
+                },
+            },
+        )
+
+        response = self.client.post(
+            "/api/keys/export",
+            headers=self.headers,
+            json={"ids": [key_id], "format": "txt"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.text,
+            f"{api_key}|us-east-1\n{api_key}|eu-west-1",
+        )
+        self.assertEqual(db.list_vault(), [])
+
+    def test_native_bedrock_api_key_job_uses_bearer_region_count(self):
+        api_key = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "B" * 80 + "="
+        with (
+            patch("app.run_job", new_callable=AsyncMock),
+            patch(
+                "app.bedrock_checker.configured_api_key_regions",
+                return_value=("us-east-1", "us-west-2", "eu-west-1"),
+            ),
+        ):
+            response = self.client.post(
+                "/api/keys/import",
+                headers=self.headers,
+                json={"text": api_key, "concurrency": 2},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["breakdown"], {"aws_bedrock": 1})
+        job = db.get_job(response.json()["job_id"])
+        self.assertEqual(job["detail_total"], 3)
 
     def test_deep_recheck_only_queues_bedrock(self):
         aws_key = "AKIA0000000000000000|" + "A" * 40

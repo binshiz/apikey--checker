@@ -1,10 +1,11 @@
-"""OpenAI key checker — tier via TPM/RPM headers + dynamic model discovery."""
-import asyncio
+"""OpenAI key checker — exact rate-limit windows + dynamic model discovery."""
 import re
-import time
+from typing import Any
+
 import httpx
 
 BASE = "https://api.openai.com"
+MAX_PROBE_ATTEMPTS = 3
 
 PROBE_MODELS = [
     {
@@ -59,14 +60,37 @@ PROBE_MODELS = [
     },
 ]
 
-RL_HEADERS_RPM = [
-    "x-ratelimit-limit-requests",
-    "x-ratelimit-limit-requests-per-minute",
-]
-RL_HEADERS_TPM = [
-    "x-ratelimit-limit-tokens",
-    "x-ratelimit-limit-tokens-per-minute",
-]
+RATE_LIMIT_HEADERS = {
+    "requests": {
+        "limit": (
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-limit-requests-per-minute",
+        ),
+        "remaining": ("x-ratelimit-remaining-requests",),
+        "reset": ("x-ratelimit-reset-requests",),
+    },
+    "tokens": {
+        "limit": (
+            "x-ratelimit-limit-tokens",
+            "x-ratelimit-limit-tokens-per-minute",
+        ),
+        "remaining": ("x-ratelimit-remaining-tokens",),
+        "reset": ("x-ratelimit-reset-tokens",),
+    },
+    "project_tokens": {
+        "limit": ("x-ratelimit-limit-project-tokens",),
+        "remaining": ("x-ratelimit-remaining-project-tokens",),
+        "reset": ("x-ratelimit-reset-project-tokens",),
+    },
+}
+
+QUOTA_429_CODES = {
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+}
 
 MODEL_GROUP_ORDER = [
     "text",
@@ -96,9 +120,37 @@ def _parse_int(v):
         return None
 
 
+def _first_header(h: httpx.Headers, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = h.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _extract_rate_limits(h: httpx.Headers) -> dict[str, dict[str, int | str]]:
+    """Extract exact current-window values without treating them as cash balance."""
+    rate_limits: dict[str, dict[str, int | str]] = {}
+    for dimension, fields in RATE_LIMIT_HEADERS.items():
+        item: dict[str, int | str] = {}
+        for field in ("limit", "remaining"):
+            value = _parse_int(_first_header(h, fields[field]))
+            if value is not None and value >= 0:
+                item[field] = value
+        reset = _first_header(h, fields["reset"])
+        if reset:
+            item["reset"] = reset[:100]
+        if item:
+            rate_limits[dimension] = item
+    return rate_limits
+
+
 def _extract_rl(h: httpx.Headers) -> tuple[int | None, int | None]:
-    rpm = next((_parse_int(h.get(x)) for x in RL_HEADERS_RPM if h.get(x)), None)
-    tpm = next((_parse_int(h.get(x)) for x in RL_HEADERS_TPM if h.get(x)), None)
+    rate_limits = _extract_rate_limits(h)
+    rpm = rate_limits.get("requests", {}).get("limit")
+    tpm = rate_limits.get("tokens", {}).get("limit")
+    if tpm is None:
+        tpm = rate_limits.get("project_tokens", {}).get("limit")
     return rpm, tpm
 
 
@@ -115,20 +167,6 @@ def _tpm_to_tier(tpm: int, mp: dict) -> str | None:
         if diff <= 0.15 and diff < best_diff:
             best, best_diff = tier, diff
     return best
-
-
-def _guess_tier_from_rpm(rpm: int | None) -> str | None:
-    if rpm is None:
-        return None
-    if rpm <= 10:
-        return "Free"
-    if rpm <= 500:
-        return "Tier 1"
-    if rpm <= 5000:
-        return "Tier 2-3"
-    if rpm <= 10000:
-        return "Tier 4"
-    return "Tier 5"
 
 
 def _version_parts(model_id: str) -> tuple[int, ...]:
@@ -262,151 +300,342 @@ def build_supported_models(model_ids: list[str]) -> dict:
     }
 
 
-async def _detect_tier(client: httpx.AsyncClient, key: str) -> tuple[str | None, int | None, int | None]:
-    """Return (tier, rpm, tpm). tier='no_quota' if all probes hit insufficient_quota."""
-    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    collected_rpm = None
-    collected_tpm = None
-    all_no_quota = True
+def _dynamic_probe_sort_key(model_id: str) -> tuple:
+    """Prefer cheaper mini/nano variants before larger dynamically discovered models."""
+    lowered = model_id.lower()
+    size_rank = 0 if "nano" in lowered else 1 if "mini" in lowered else 2
+    return (size_rank, _model_sort_key(model_id))
 
-    for probe in PROBE_MODELS:
-        model = probe["model"]
-        payload = {
+
+def _probe_candidates(model_ids: list[str]) -> list[dict[str, Any]]:
+    """Choose a few visible text models without assuming the catalog is static."""
+    available = set(_sorted_models(model_ids))
+    candidates: list[dict[str, Any]] = []
+    seen = set()
+
+    for configured in PROBE_MODELS:
+        model = configured["model"]
+        if available and model not in available:
+            continue
+        candidates.append({
+            **configured,
+            "endpoint": (
+                "responses"
+                if _classify_model(model) == "reasoning"
+                else "chat_completions"
+            ),
+        })
+        seen.add(model)
+
+    dynamic_models = sorted(
+        (
+            model
+            for model in available
+            if model not in seen
+            and not model.startswith(("ft:", "chatgpt-"))
+            and _classify_model(model) in {"text", "reasoning"}
+            and not any(
+                marker in model.lower()
+                for marker in ("audio", "realtime", "search", "transcribe")
+            )
+        ),
+        key=_dynamic_probe_sort_key,
+    )
+    for model in dynamic_models:
+        candidates.append({
             "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}],
-        }
+            "tpm_to_tier": {},
+            "endpoint": "responses",
+        })
+
+    return candidates[:MAX_PROBE_ATTEMPTS]
+
+
+def _parse_error_limit_observation(message: str) -> dict[str, Any]:
+    """Extract only numeric 429 observations; never retain the upstream message."""
+    text = str(message or "").strip()
+    if not text:
+        return {}
+
+    lowered = text.lower()
+    if re.search(r"\b(?:tokens?\s+per\s+min(?:ute)?|tpm)\b", lowered):
+        dimension = "tokens"
+    elif re.search(r"\b(?:requests?\s+per\s+min(?:ute)?|rpm)\b", lowered):
+        dimension = "requests"
+    else:
+        dimension = None
+
+    observation: dict[str, Any] = {}
+    for field in ("limit", "used", "requested"):
+        match = re.search(
+            rf"\b{field}\s*:?\s*([\d,]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        value = _parse_int(match.group(1)) if match else None
+        if value is not None and value >= 0:
+            observation[field] = value
+    if "limit" not in observation:
+        return {}
+
+    if dimension:
+        observation["dimension"] = dimension
+    retry_match = re.search(
+        r"(?:try again in|retry after)\s*"
+        r"([0-9]*\.?[0-9]+\s*(?:ms|s|sec(?:ond)?s?|m|min(?:ute)?s?))",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if retry_match:
+        observation["retry_after"] = retry_match.group(1).replace(" ", "")[:40]
+    observation["source"] = "error_message"
+    return observation
+
+
+def _response_error_info(response: httpx.Response, key: str) -> dict[str, Any]:
+    """Return sanitized error metadata without persisting an upstream error body."""
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        return {}
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return {}
+
+    info: dict[str, Any] = {}
+    for source_field, output_field in (("code", "code"), ("type", "type")):
+        value = error.get(source_field)
+        if value:
+            safe_value = str(value).replace(key, "[redacted]").strip()[:100]
+            if safe_value:
+                info[output_field] = safe_value
+
+    message = str(error.get("message") or "").replace(key, "[redacted]")
+    observation = _parse_error_limit_observation(message)
+    if observation:
+        info["rate_limit_observation"] = observation
+    return info
+
+
+async def _probe_rate_limits(
+    client: httpx.AsyncClient,
+    key: str,
+    model_ids: list[str],
+) -> dict[str, Any]:
+    """Make at most a few sequential minimal calls and retain exact limit windows."""
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    candidates = _probe_candidates(model_ids)
+    outcome: dict[str, Any] = {
+        "tier": None,
+        "rpm": None,
+        "tpm": None,
+        "tier_source": None,
+        "tier_confidence": None,
+        "rate_limit_windows": [],
+        "rate_limit_observation": None,
+        "retry_after": None,
+        "request_id": None,
+        "quota_reason": None,
+        "probes": [],
+        "callable": False,
+        "rate_limited": False,
+        "no_quota": False,
+        "model_blocked": not candidates,
+    }
+    http_attempts = 0
+    quota_responses = 0
+    blocked_responses = 0
+
+    for candidate in candidates:
+        model = candidate["model"]
+        endpoint = candidate["endpoint"]
+        if endpoint == "responses":
+            url = f"{BASE}/v1/responses"
+            payload = {
+                "model": model,
+                "input": ".",
+                "max_output_tokens": 16,
+                "store": False,
+            }
+        else:
+            url = f"{BASE}/v1/chat/completions"
+            payload = {
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "."}],
+            }
+
+        probe: dict[str, Any] = {"model": model, "endpoint": endpoint}
         try:
-            resp = await client.post(f"{BASE}/v1/chat/completions", headers=hdrs, json=payload, timeout=30.0)
-        except Exception:
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=20.0,
+            )
+        except httpx.TimeoutException:
+            probe.update(status="timeout", error="timeout")
+            outcome["probes"].append(probe)
+            continue
+        except httpx.RequestError as exc:
+            probe.update(status="network_error", error=type(exc).__name__)
+            outcome["probes"].append(probe)
+            continue
+        except Exception as exc:
+            probe.update(status="network_error", error=type(exc).__name__)
+            outcome["probes"].append(probe)
             continue
 
-        status = resp.status_code
-        if status == 401:
-            return None, None, None
-        if status in (403, 404):
-            all_no_quota = False
-            continue
-        if status == 429:
-            try:
-                body = resp.json()
-                if body.get("error", {}).get("code") == "insufficient_quota":
-                    continue
-            except Exception:
-                pass
+        http_attempts += 1
+        status_code = response.status_code
+        error_info = _response_error_info(response, key)
+        error_code = error_info.get("code") or error_info.get("type")
+        error_type = error_info.get("type")
+        probe["http_status"] = status_code
+        if error_code:
+            probe["error_code"] = error_code
+        if error_type and error_type != error_code:
+            probe["error_type"] = error_type
 
-        all_no_quota = False
-        rpm, tpm = _extract_rl(resp.headers)
-        if rpm is not None:
-            collected_rpm = rpm
-        if tpm is not None:
-            collected_tpm = tpm
-        if tpm is not None:
-            tier = _tpm_to_tier(tpm, probe["tpm_to_tier"])
+        request_id = str(response.headers.get("x-request-id") or "").strip()[:100]
+        if request_id:
+            probe["request_id"] = request_id
+            if outcome["request_id"] is None:
+                outcome["request_id"] = request_id
+
+        retry_after = str(response.headers.get("retry-after") or "").strip()[:100]
+        observation = error_info.get("rate_limit_observation")
+        if observation:
+            observation = {
+                "model": model,
+                "endpoint": endpoint,
+                **observation,
+            }
+            probe["rate_limit_observation"] = observation
+            if outcome["rate_limit_observation"] is None:
+                outcome["rate_limit_observation"] = observation
+            if not retry_after:
+                retry_after = str(observation.get("retry_after") or "")
+            observed_limit = observation.get("limit")
+            if observation.get("dimension") == "tokens" and outcome["tpm"] is None:
+                outcome["tpm"] = observed_limit
+            elif (
+                observation.get("dimension") == "requests"
+                and outcome["rpm"] is None
+            ):
+                outcome["rpm"] = observed_limit
+        if retry_after:
+            probe["retry_after"] = retry_after
+            if outcome["retry_after"] is None:
+                outcome["retry_after"] = retry_after
+
+        rate_limits = _extract_rate_limits(response.headers)
+        if rate_limits:
+            window = {
+                "model": model,
+                "endpoint": endpoint,
+                "limits": rate_limits,
+            }
+            outcome["rate_limit_windows"].append(window)
+            probe["rate_limits"] = rate_limits
+
+            request_limit = rate_limits.get("requests", {}).get("limit")
+            model_token_limit = rate_limits.get("tokens", {}).get("limit")
+            project_token_limit = rate_limits.get("project_tokens", {}).get("limit")
+            if outcome["rpm"] is None and request_limit is not None:
+                outcome["rpm"] = request_limit
+            if outcome["tpm"] is None:
+                outcome["tpm"] = (
+                    model_token_limit
+                    if model_token_limit is not None
+                    else project_token_limit
+                )
+
+            tier = None
+            if model_token_limit is not None and candidate["tpm_to_tier"]:
+                tier = _tpm_to_tier(model_token_limit, candidate["tpm_to_tier"])
+                if tier:
+                    outcome["tier_source"] = "model_tpm_header_estimate"
             if tier:
-                return tier, rpm, tpm
+                outcome["tier"] = tier
+                outcome["tier_confidence"] = "low"
 
-    if all_no_quota:
-        return "no_quota", None, None
-    if collected_tpm is not None:
-        t = _tpm_to_tier(collected_tpm, PROBE_MODELS[0]["tpm_to_tier"])
-        if t:
-            return t, collected_rpm, collected_tpm
-    if collected_rpm is not None:
-        return _guess_tier_from_rpm(collected_rpm), collected_rpm, collected_tpm
-    return None, collected_rpm, collected_tpm
+        if status_code == 200:
+            probe["status"] = "callable"
+            outcome["callable"] = True
+        elif status_code == 429 and error_code in QUOTA_429_CODES:
+            probe["status"] = "no_quota"
+            quota_responses += 1
+            if outcome["quota_reason"] is None:
+                outcome["quota_reason"] = error_code or error_type
+        elif status_code == 429:
+            probe["status"] = "rate_limited"
+            outcome["rate_limited"] = True
+        elif status_code == 401:
+            probe["status"] = "authentication_failed"
+        elif status_code == 403:
+            probe["status"] = "access_denied"
+            blocked_responses += 1
+        elif status_code == 404:
+            probe["status"] = "model_unavailable"
+            blocked_responses += 1
+        elif status_code >= 500:
+            probe["status"] = "upstream_error"
+        else:
+            probe["status"] = "request_rejected"
+        outcome["probes"].append(probe)
+
+        # One exact runtime window is more useful than manufacturing a 429.
+        if rate_limits and status_code in (200, 429):
+            break
+
+    outcome["no_quota"] = (
+        quota_responses > 0
+        and not outcome["callable"]
+        and not outcome["rate_limited"]
+    )
+    outcome["model_blocked"] = (
+        not candidates
+        or (http_attempts > 0 and blocked_responses == http_attempts)
+    )
+    return outcome
 
 
 async def _list_models(client: httpx.AsyncClient, key: str):
-    """Return (alive, model_ids, org_id, error, rpm_header, tpm_header)."""
+    """Return (alive, model_ids, org_id, error, rate_limit_window)."""
     try:
         resp = await client.get(
             f"{BASE}/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=25.0
         )
     except httpx.TimeoutException:
-        return False, [], None, "timeout", None, None
+        return False, [], None, "timeout", {}
     except Exception as e:
-        return False, [], None, f"{type(e).__name__}", None, None
+        return False, [], None, f"{type(e).__name__}", {}
 
     if resp.status_code == 401:
-        return False, [], None, "invalid/revoked", None, None
+        return False, [], None, "invalid/revoked", {}
     if resp.status_code == 429:
-        rpm, tpm = _extract_rl(resp.headers)
-        return True, [], resp.headers.get("openai-organization"), "rate_limited", rpm, tpm
+        return (
+            True,
+            [],
+            resp.headers.get("openai-organization"),
+            "rate_limited",
+            _extract_rate_limits(resp.headers),
+        )
     if resp.status_code != 200:
-        return False, [], None, f"HTTP {resp.status_code}", None, None
+        return False, [], None, f"HTTP {resp.status_code}", {}
     try:
         data = resp.json().get("data", [])
         ids = sorted([m["id"] for m in data if "id" in m])
     except Exception:
         ids = []
-    rpm, tpm = _extract_rl(resp.headers)
-    return True, ids, resp.headers.get("openai-organization"), None, rpm, tpm
-
-
-async def _burst_rpm_probe(client: httpx.AsyncClient, key: str, cap: int = 60) -> dict:
-    """Conservative RPM burst: fire `cap` minimal requests in parallel, classify by 429 timing.
-
-    Returns:
-      {ok, hit_429, no_quota, model_blocked, elapsed, rpm_estimate}
-    """
-    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-    # Find a model the key can actually call. Try cheap models in order.
-    for model in ("gpt-4o-mini", "gpt-3.5-turbo", "gpt-4.1-mini"):
-        payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "."}]}
-        try:
-            r0 = await client.post(f"{BASE}/v1/chat/completions", headers=hdrs, json=payload, timeout=15)
-        except Exception:
-            continue
-        if r0.status_code in (200, 429):
-            picked = model
-            break
-        # 403/404/etc — try next
-    else:
-        return {"ok": 0, "hit_429": False, "no_quota": False, "model_blocked": True, "elapsed": 0, "rpm_estimate": None}
-
-    payload = {"model": picked, "max_tokens": 1, "messages": [{"role": "user", "content": "."}]}
-    ok = 0
-    hit_429 = False
-    no_quota = False
-
-    async def one():
-        nonlocal ok, hit_429, no_quota
-        try:
-            r = await client.post(f"{BASE}/v1/chat/completions", headers=hdrs, json=payload, timeout=15)
-            if r.status_code == 200:
-                ok += 1
-            elif r.status_code == 429:
-                try:
-                    code = r.json().get("error", {}).get("code", "")
-                    if code == "insufficient_quota":
-                        no_quota = True
-                        return
-                except Exception:
-                    pass
-                hit_429 = True
-        except Exception:
-            pass
-
-    start = time.monotonic()
-    await asyncio.gather(*(one() for _ in range(cap)))
-    elapsed = time.monotonic() - start
-
-    # If we hit 429, `ok` is the count that landed in the current 1-min window
-    # before the limit kicked in → that's roughly the RPM ceiling.
-    # If no 429, the account handled `cap` in `elapsed`s; project to 60s.
-    if hit_429:
-        rpm_estimate = ok
-    else:
-        # Project to per-minute, but never below ok.
-        rpm_estimate = max(ok, int(ok / max(elapsed, 0.5) * 60))
-
-    return {
-        "ok": ok, "hit_429": hit_429, "no_quota": no_quota,
-        "model_blocked": False, "elapsed": round(elapsed, 2),
-        "rpm_estimate": rpm_estimate, "model": picked,
-    }
+    return (
+        True,
+        ids,
+        resp.headers.get("openai-organization"),
+        None,
+        _extract_rate_limits(resp.headers),
+    )
 
 
 async def check(key: str, proxy: str | None = None) -> dict:
@@ -423,12 +652,12 @@ async def check(key: str, proxy: str | None = None) -> dict:
     client_kw = dict(
         timeout=httpx.Timeout(30.0, connect=10.0),
         follow_redirects=True,
-        limits=httpx.Limits(max_connections=80),
+        limits=httpx.Limits(max_connections=10),
     )
     if proxy:
         client_kw["proxy"] = proxy
     async with httpx.AsyncClient(**client_kw) as client:
-        alive, models, org_id, err, list_rpm, list_tpm = await _list_models(client, key)
+        alive, models, org_id, err, catalog_limits = await _list_models(client, key)
         if not alive:
             result["status"] = "invalid"
             result["error"] = err or "dead"
@@ -439,20 +668,49 @@ async def check(key: str, proxy: str | None = None) -> dict:
         result["extra"]["models_count"] = supported["all_count"]
         result["extra"]["org_id"] = org_id
         result["extra"]["models_preview"] = _sorted_models(models)[:30]
+        if err:
+            result["extra"]["models_error"] = err
 
-        tier, rpm, tpm = await _detect_tier(client, key)
-        # Prefer /v1/models headers if probes returned nothing
-        if rpm is None and list_rpm is not None:
-            rpm = list_rpm
-        if tpm is None and list_tpm is not None:
-            tpm = list_tpm
-        # If probes gave no tier but /v1/models headers exist, try mapping from those.
-        if tier is None and list_tpm is not None:
-            tier = _tpm_to_tier(list_tpm, PROBE_MODELS[0]["tpm_to_tier"])
-        if tier is None and rpm is not None:
-            tier = _guess_tier_from_rpm(rpm)
-        result["rpm"] = rpm
-        result["tpm"] = tpm
+        probe = await _probe_rate_limits(client, key, models)
+        runtime_windows = list(probe["rate_limit_windows"])
+        windows = list(runtime_windows)
+        if catalog_limits:
+            windows.append({
+                "model": "model catalog",
+                "endpoint": "models",
+                "limits": catalog_limits,
+            })
+        if windows:
+            result["extra"]["rate_limit_window"] = windows[0]
+            result["extra"]["rate_limit_windows"] = windows
+        if runtime_windows:
+            result["extra"]["rate_limit_source"] = "response_headers"
+        elif probe["rate_limit_observation"]:
+            result["extra"]["rate_limit_source"] = "error_message_observation"
+        elif catalog_limits:
+            result["extra"]["rate_limit_source"] = "response_headers"
+        else:
+            result["extra"]["rate_limit_source"] = "unavailable"
+
+        result["extra"]["rate_limit_probes"] = probe["probes"]
+        if probe["rate_limit_observation"]:
+            result["extra"]["rate_limit_observation"] = probe["rate_limit_observation"]
+        if probe["retry_after"]:
+            result["extra"]["retry_after"] = probe["retry_after"]
+        if probe["request_id"]:
+            result["extra"]["request_id"] = probe["request_id"]
+        if probe["quota_reason"]:
+            result["extra"]["quota_reason"] = probe["quota_reason"]
+        result["extra"]["tier_source"] = probe["tier_source"] or "unavailable"
+        if probe["tier_confidence"]:
+            result["extra"]["tier_confidence"] = probe["tier_confidence"]
+
+        catalog_rpm = catalog_limits.get("requests", {}).get("limit")
+        catalog_tpm = catalog_limits.get("tokens", {}).get("limit")
+        if catalog_tpm is None:
+            catalog_tpm = catalog_limits.get("project_tokens", {}).get("limit")
+        result["rpm"] = probe["rpm"] if probe["rpm"] is not None else catalog_rpm
+        result["tpm"] = probe["tpm"] if probe["tpm"] is not None else catalog_tpm
 
         # Legacy compatibility flags derived from the dynamic /v1/models result.
         groups = supported["groups"]
@@ -466,38 +724,73 @@ async def check(key: str, proxy: str | None = None) -> dict:
         result["extra"]["has_sora_2"] = any(mid.startswith(("sora-2", "sora-2-pro")) for mid in video_models)
         result["extra"]["has_gpt_5_5"] = any(mid.startswith(("gpt-5.5", "gpt-5.5-mini")) for mid in text_models)
 
-        if tier == "no_quota":
+        if probe["callable"]:
+            result["extra"]["invocation_verification"] = "success"
+        elif probe["no_quota"]:
+            result["extra"]["invocation_verification"] = "no_quota"
+        elif probe["rate_limited"]:
+            result["extra"]["invocation_verification"] = "rate_limited"
+        elif probe["model_blocked"]:
+            result["extra"]["invocation_verification"] = "model_unavailable"
+        else:
+            result["extra"]["invocation_verification"] = "inconclusive"
+
+        if probe["no_quota"]:
             result["status"] = "no_quota"
             result["tier"] = None
             return result
 
-        # ── Burst RPM probe as last-resort tier signal ──
-        if tier is None:
-            burst = await _burst_rpm_probe(client, key, cap=60)
-            result["extra"]["burst_probe"] = burst
-            if burst["no_quota"]:
-                result["status"] = "no_quota"
-                result["tier"] = None
-                return result
-            if burst["model_blocked"]:
-                result["status"] = "valid"
-                result["tier"] = "Unknown"
-                result["extra"]["tier_reason"] = "no probe model accessible"
-                return result
-            rpm_est = burst["rpm_estimate"] or 0
-            if rpm_est > 0:
-                result["rpm"] = result["rpm"] or rpm_est
-                tier = _guess_tier_from_rpm(rpm_est)
-            if tier is None and burst["ok"] > 0:
-                tier = "Tier 1"  # something works, conservatively assume lowest paid tier
-                result["extra"]["tier_reason"] = "burst succeeded, low confidence"
-
-        if tier is None:
-            result["status"] = "valid"
-            result["tier"] = "Unknown"
-            result["extra"].setdefault("tier_reason", "no rate-limit signal from any source")
+        result["status"] = "valid"
+        if probe["tier"] is not None:
+            result["tier"] = probe["tier"]
+            result["extra"]["tier_reason_code"] = "header_estimate"
+            result["extra"]["tier_reason"] = "根据响应限流 Header 估算，非 OpenAI 官方等级"
         else:
-            result["status"] = "valid"
-            result["tier"] = tier
+            result["tier"] = "Unknown"
+            if runtime_windows:
+                reason_code = "official_tier_unavailable"
+                reason = "已获取限流窗口；普通 API Key 无法直接读取官方 Usage Tier"
+            elif probe["rate_limit_observation"]:
+                observation = probe["rate_limit_observation"]
+                metric = (
+                    "TPM"
+                    if observation.get("dimension") == "tokens"
+                    else "RPM"
+                    if observation.get("dimension") == "requests"
+                    else "限流"
+                )
+                reason_code = "rate_limit_observed_from_error"
+                reason = f"已从 429 错误正文读取{metric}上限；该值不是稳定 Header"
+            elif windows:
+                reason_code = "official_tier_unavailable"
+                reason = "已获取接口限流窗口；普通 API Key 无法直接读取官方 Usage Tier"
+            elif probe["callable"] and probe["rate_limited"]:
+                reason_code = "partial_probe_rate_limited"
+                reason = (
+                    "Key 有效且本轮至少一次最小模型调用成功；"
+                    "另有探测请求返回 HTTP 429，不代表整条 Key 当前全面限流"
+                )
+            elif probe["rate_limited"] and probe["retry_after"]:
+                reason_code = "rate_limited_retry_after"
+                reason = (
+                    "Key 有效；本轮最小模型调用探测返回 HTTP 429，"
+                    f"服务端建议 {probe['retry_after']} 后重试，"
+                    "不代表整条 Key 当前全面限流"
+                )
+            elif probe["rate_limited"]:
+                reason_code = "rate_limited_without_window"
+                reason = (
+                    "Key 有效；本轮至少一次最小模型调用探测返回 HTTP 429，"
+                    "但响应未提供可解析的限流窗口；"
+                    "不代表整条 Key 当前全面限流"
+                )
+            elif probe["model_blocked"]:
+                reason_code = "probe_model_unavailable"
+                reason = "Key 有效，但当前可见模型无法完成最小调用探测"
+            else:
+                reason_code = "rate_limit_window_unavailable"
+                reason = "Key 有效，但 OpenAI 未返回限流窗口"
+            result["extra"]["tier_reason_code"] = reason_code
+            result["extra"]["tier_reason"] = reason
 
     return result

@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Noto+Sans+SC:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/style.css?v=20260712-bedrock-sales-a11y" />
+    <link rel="stylesheet" href="/static/style.css?v=20260725-bedrock-groups" />
   </head>
   <body>
     <!-- Auth gate -->
@@ -39,7 +39,7 @@
     <header class="topbar">
       <h1>🔑 API Key Tier Detector</h1>
       <div class="brand-sub">
-        OpenAI · Claude · Gemini · AWS Bedrock · 自动识别 / 批量探测 / 库存销售
+        OpenAI · OpenRouter · Claude · Gemini · AWS Bedrock · GCP · 自动识别 / 批量探测 / 库存销售
       </div>
       <nav class="tabs" role="tablist" aria-label="主要功能">
         <button id="tab-check" class="tab active" type="button" role="tab" data-tab="check" aria-controls="view-check" aria-selected="true">🔍 检测</button>
@@ -165,11 +165,38 @@
           <textarea
             id="keys-input"
             rows="8"
+            aria-describedby="keys-input-help"
             placeholder="sk-proj-...
+sk-or-v1-...
 sk-ant-api03-...
 AIzaSy...
+https://my-resource.openai.azure.com|0123456789abcdef0123456789abcdef
+https://my-resource.services.ai.azure.com/openai/v1/chat/completions|long-resource-key
+ABSKQmVkcm9ja0FQSUtleS0...
 AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           ></textarea>
+          <p id="keys-input-help" class="muted form-hint">
+            支持普通 Key（包括 OpenRouter）、Azure 端点与 Key，以及单个完整 GCP Service Account JSON。OpenRouter 会通过额度接口读取账号总额度、已使用额度和剩余额度；普通 Key 还会分别对 Claude Opus 5 和 Claude Fable 5 发送一次最小付费调用，两者都失败时再用 openrouter/free 验证 Key。Management Key 不调用模型，只读取账号额度。Anthropic Key 也会最小调用 Claude Opus 5。GCP JSON 也可通过下方文件选择器批量导入。
+          </p>
+
+          <div class="credential-file-import">
+            <label for="gcp-files" class="credential-file-label">
+              GCP Service Account JSON 文件
+            </label>
+            <input
+              id="gcp-files"
+              type="file"
+              accept=".json,application/json"
+              multiple
+              aria-describedby="gcp-file-help gcp-file-summary gcp-file-error"
+            />
+            <button id="gcp-files-clear" class="btn btn-small hidden" type="button">清空文件</button>
+            <span id="gcp-file-summary" class="file-summary hidden" role="status" aria-live="polite"></span>
+          </div>
+          <p id="gcp-file-help" class="muted form-hint">
+            最多 100 个文件，每个不超过 64 KiB。检测会先换取 OAuth Token，再对目标 Vertex AI Gemini 模型发送最小化真实生成请求，可能产生少量模型费用；不检测 Google Play、IAM 或其他 GCP API 权限。
+          </p>
+          <p id="gcp-file-error" class="auth-error hidden" role="alert"></p>
 
           <div class="row">
             <label
@@ -197,9 +224,12 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
               <select id="f-provider">
                 <option value="">全部</option>
                 <option value="openai">OpenAI</option>
+                <option value="azure_openai">Azure OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
                 <option value="aws_bedrock">AWS Bedrock</option>
+                <option value="gcp_service_account">GCP Service Account</option>
+                <option value="openrouter">OpenRouter</option>
               </select>
             </label>
             <label
@@ -227,6 +257,7 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
                 <option>Tier 4</option>
                 <option>Tier 5</option>
                 <option>Free</option>
+                <option>Paid</option>
                 <option>Unknown</option>
               </select>
             </label>
@@ -279,9 +310,12 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
               <select id="v-provider">
                 <option value="">全部</option>
                 <option value="openai">OpenAI</option>
+                <option value="azure_openai">Azure OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
                 <option value="aws_bedrock">AWS Bedrock</option>
+                <option value="gcp_service_account">GCP Service Account</option>
+                <option value="openrouter">OpenRouter</option>
               </select>
             </label>
             <label
@@ -304,6 +338,7 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
                 <option>Tier 4</option>
                 <option>Tier 5</option>
                 <option>Free</option>
+                <option>Paid</option>
                 <option>Unknown</option>
               </select>
             </label>
@@ -363,9 +398,12 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
               <select id="i-provider">
                 <option value="">全部</option>
                 <option value="openai">OpenAI</option>
+                <option value="azure_openai">Azure OpenAI</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
                 <option value="aws_bedrock">AWS Bedrock</option>
+                <option value="gcp_service_account">GCP Service Account</option>
+                <option value="openrouter">OpenRouter</option>
               </select>
             </label>
             <label
@@ -395,6 +433,7 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
                 <option>Tier 4</option>
                 <option>Tier 5</option>
                 <option>Free</option>
+                <option>Paid</option>
                 <option>Unknown</option>
               </select>
             </label>
@@ -470,6 +509,6 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260713-bedrock-runtime-proof"></script>
+    <script src="/static/app.js?v=20260727-anthropic-quota-v1"></script>
   </body>
 </html>
