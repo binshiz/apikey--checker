@@ -383,6 +383,38 @@ def build_compatible_gateway_route_groups(
             continue
         signature = tuple(sorted(mapping.items()))
         grouped.setdefault(signature, []).append(region)
+
+    scope_priority = {
+        "global": 0,
+        "eu": 1,
+        "us": 2,
+        "au": 3,
+    }
+
+    def route_group_sort_key(
+        signature: tuple[tuple[str, str], ...],
+    ) -> tuple[int, tuple[str, ...], str]:
+        scopes = {
+            target.split(".", 1)[0]
+            for _, target in signature
+            if "." in target
+        }
+        specific_scopes = sorted(
+            (scope for scope in scopes if scope != "global"),
+            key=lambda scope: (scope_priority.get(scope, 99), scope),
+        )
+        primary_scope = (
+            specific_scopes[0]
+            if specific_scopes
+            else "global" if "global" in scopes
+            else ""
+        )
+        return (
+            scope_priority.get(primary_scope, 99),
+            tuple(specific_scopes),
+            grouped[signature][0],
+        )
+
     return [
         {
             "regions": grouped[signature],
@@ -390,7 +422,7 @@ def build_compatible_gateway_route_groups(
         }
         for signature in sorted(
             grouped,
-            key=lambda value: grouped[value][0],
+            key=route_group_sort_key,
         )
     ]
 

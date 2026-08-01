@@ -9,6 +9,11 @@ from db import _is_callable_valid_check
 ENDPOINT = "resource-name.openai.azure.com"
 API_KEY = "0123456789abcdef0123456789abcdef"
 CREDENTIAL = f"{ENDPOINT}|{API_KEY}"
+DEPLOYMENT_URL = (
+    "https://resource-name.cognitiveservices.azure.com/openai/deployments/"
+    "gpt-5.5/chat/completions?api-version=2025-04-01-preview"
+)
+DEPLOYMENT_CREDENTIAL = f"{DEPLOYMENT_URL}|{API_KEY}"
 
 
 def deployment_not_found() -> httpx.Response:
@@ -18,37 +23,99 @@ def deployment_not_found() -> httpx.Response:
 
 
 class AzureOpenAICheckerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_services_ai_full_chat_url_uses_v1_routes(self):
-        services_endpoint = "resource-name.services.ai.azure.com"
+    async def test_cognitive_services_deployment_url_is_called_without_rewriting(self):
         requests = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            if request.method == "GET":
-                return httpx.Response(200, json={"data": [{"id": "gpt-5.5"}]})
             payload = __import__("json").loads(request.read())
-            if payload["model"] == "gpt-5.5":
-                return httpx.Response(200, json={"model": "gpt-5.5"})
-            return deployment_not_found()
+            self.assertNotIn("model", payload)
+            self.assertEqual(request.headers["api-key"], API_KEY)
+            return httpx.Response(
+                200,
+                headers={"apim-request-id": "request-123"},
+                json={"model": "gpt-5.5-2026-04-24", "choices": [{}]},
+            )
 
-        credential = (
-            f"https://{services_endpoint}/openai/v1/chat/completions|{API_KEY}"
-        )
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            result = await _validate_with_client(client, credential)
+            result = await _validate_with_client(client, DEPLOYMENT_CREDENTIAL)
 
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(str(requests[0].url), DEPLOYMENT_URL)
         self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["extra"]["deployment"], "gpt-5.5")
+        self.assertEqual(result["extra"]["api_version"], "2025-04-01-preview")
         self.assertEqual(
             result["extra"]["chat_completions_url"],
-            f"https://{services_endpoint}/openai/v1/chat/completions",
+            DEPLOYMENT_URL,
         )
-        self.assertTrue(all(
-            request.url.host == services_endpoint for request in requests
-        ))
-        self.assertEqual(requests[0].url.path, "/openai/v1/models")
-        self.assertTrue(any(
-            request.url.path == "/openai/v1/chat/completions" for request in requests
-        ))
+        self.assertEqual(
+            result["extra"]["verified_callable_targets"],
+            ["gpt-5.5"],
+        )
+        self.assertEqual(
+            result["extra"]["target_model_probes"]["gpt-5.5"]["status"],
+            "callable",
+        )
+        self.assertEqual(result["extra"]["request_id"], "request-123")
+
+    async def test_cognitive_services_deployment_rejects_invalid_key(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={
+                "error": {"code": "401", "message": "Access denied"},
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await _validate_with_client(client, DEPLOYMENT_CREDENTIAL)
+
+        self.assertEqual(result["status"], "invalid")
+        self.assertEqual(result["error"], "invalid/revoked")
+        self.assertEqual(
+            result["extra"]["invocation_verification"],
+            "authentication_failed",
+        )
+
+    async def test_services_full_chat_urls_use_v1_routes(self):
+        for services_endpoint in (
+            "resource-name.services.ai.azure.com",
+            "resource-name.services.azure.com",
+        ):
+            with self.subTest(endpoint=services_endpoint):
+                requests = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    if request.method == "GET":
+                        return httpx.Response(
+                            200,
+                            json={"data": [{"id": "gpt-5.5"}]},
+                        )
+                    payload = __import__("json").loads(request.read())
+                    if payload["model"] == "gpt-5.5":
+                        return httpx.Response(200, json={"model": "gpt-5.5"})
+                    return deployment_not_found()
+
+                credential = (
+                    f"https://{services_endpoint}/openai/v1/chat/completions"
+                    f"|{API_KEY}"
+                )
+                transport = httpx.MockTransport(handler)
+                async with httpx.AsyncClient(transport=transport) as client:
+                    result = await _validate_with_client(client, credential)
+
+                self.assertEqual(result["status"], "valid")
+                self.assertEqual(
+                    result["extra"]["chat_completions_url"],
+                    f"https://{services_endpoint}/openai/v1/chat/completions",
+                )
+                self.assertTrue(all(
+                    request.url.host == services_endpoint for request in requests
+                ))
+                self.assertEqual(requests[0].url.path, "/openai/v1/models")
+                self.assertTrue(any(
+                    request.url.path == "/openai/v1/chat/completions"
+                    for request in requests
+                ))
 
     async def test_catalog_and_runtime_access_are_recorded_separately(self):
         requests = []

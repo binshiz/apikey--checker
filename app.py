@@ -913,9 +913,10 @@ def _secret_export_bundle_block(row: dict) -> str:
     if not mapping:
         return key_text
 
-    # Group Fable 5 regions before all other callable regions. Each JSON object
-    # contains only alias/target pairs proven identically across every
-    # credential line immediately above it.
+    # Group Fable 5 regions before all other callable regions. When one
+    # capability group needs multiple AWS geography routes, emit each compatible
+    # route as its own ``credential lines + flat JSON`` block. This keeps every
+    # mapping directly associated with exactly the regions where it was proven.
     if (
         row.get("provider") == "aws_bedrock"
         and parse_bedrock_api_key(str(row.get("api_key") or "")) is None
@@ -926,30 +927,39 @@ def _secret_export_bundle_block(row: dict) -> str:
         canonical_key = "|".join(credentials) if credentials else ""
         groups = bedrock_checker.build_gateway_region_groups(by_region)
         blocks: list[str] = []
-        for group in groups:
-            regions = group["regions"]
-            region_mapping = group["mapping"]
-            credential_lines = [
+
+        def append_route_block(
+            regions: list[str],
+            region_mapping: dict[str, str],
+        ) -> None:
+            if not regions or not region_mapping:
+                return
+            credential_text = "\n".join(
                 f"{canonical_key}|{region}"
                 for region in regions
-            ]
-            credential_text = "\n".join(credential_lines)
-            mapping_payload: dict | list = region_mapping
-            if not region_mapping and group.get("route_groups"):
-                mapping_payload = {
-                    "route_groups": group["route_groups"],
-                }
+            )
             mapping_json = json.dumps(
-                mapping_payload,
+                region_mapping,
                 ensure_ascii=False,
                 indent=2,
             )
-            blocks.append(f"{credential_text}\n\n{mapping_json}")
+            blocks.append(f"{credential_text}\n{mapping_json}")
+
+        for group in groups:
+            region_mapping = group.get("mapping")
+            if isinstance(region_mapping, dict) and region_mapping:
+                append_route_block(group["regions"], region_mapping)
+                continue
+            for route_group in group.get("route_groups", []):
+                route_mapping = route_group.get("mapping")
+                route_regions = route_group.get("regions")
+                if isinstance(route_mapping, dict) and isinstance(route_regions, list):
+                    append_route_block(route_regions, route_mapping)
         if blocks:
-            return "\n\n".join(blocks)
+            return "\n".join(blocks)
 
     mapping_json = json.dumps(mapping, ensure_ascii=False, indent=2)
-    return f"{key_text}\n\n{mapping_json}"
+    return f"{key_text}\n{mapping_json}"
 
 
 def _secret_export_response(rows: list[dict], format: str):

@@ -2,6 +2,7 @@
 
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -116,6 +117,119 @@ def _deployment_candidates(target: dict, catalog_models: list[str]) -> list[str]
         if model_id not in candidates:
             candidates.append(model_id)
     return candidates
+
+
+def _deployment_target_label(deployment: str, response_model: str | None) -> str:
+    for value in (response_model, deployment):
+        if not value:
+            continue
+        for target in TARGET_MODEL_PROBES:
+            if _matches_prefix(value, target["catalog_prefixes"]):
+                return target["label"]
+    return deployment
+
+
+async def _validate_deployment_url(
+    client: httpx.AsyncClient,
+    chat_url: str,
+    api_key: str,
+) -> dict:
+    """Validate an explicit Azure deployment without rewriting its URL."""
+    result = _result()
+    parsed_url = urlsplit(chat_url)
+    path_parts = parsed_url.path.split("/")
+    deployment = path_parts[3]
+    api_version = parse_qs(parsed_url.query)["api-version"][0]
+    result["extra"] = {
+        "endpoint": parsed_url.hostname,
+        "chat_completions_url": chat_url,
+        "deployment": deployment,
+        "api_version": api_version,
+        "validation_method": "deployment_minimal_chat_completion",
+    }
+
+    try:
+        response = await client.post(
+            chat_url,
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "max_completion_tokens": 16,
+            },
+        )
+    except httpx.TimeoutException:
+        result["error"] = "timeout"
+        return result
+    except httpx.RequestError as exc:
+        result["error"] = type(exc).__name__
+        return result
+
+    request_id = (
+        response.headers.get("x-request-id")
+        or response.headers.get("apim-request-id")
+    )
+    if request_id:
+        result["extra"]["request_id"] = request_id
+
+    response_model = _response_model(response)
+    target_label = _deployment_target_label(deployment, response_model)
+    error_code = _response_error_code(response)
+    attempt = {
+        "deployment": deployment,
+        "http_status": response.status_code,
+    }
+    if error_code:
+        attempt["error_code"] = error_code
+
+    probe_status = {
+        200: "callable",
+        401: "authentication_failed",
+        403: "access_denied",
+        404: "deployment_not_found",
+        429: "rate_limited",
+    }.get(response.status_code, "request_rejected")
+    probe = {
+        "status": probe_status,
+        "deployment": deployment,
+        "attempts": [attempt],
+    }
+    if response_model:
+        probe["response_model"] = response_model
+        result["extra"]["response_model"] = response_model
+    if error_code:
+        probe["error_code"] = error_code
+    known_labels = {target["label"] for target in TARGET_MODEL_PROBES}
+    result["extra"]["target_model_probes"] = (
+        {target_label: probe} if target_label in known_labels else {}
+    )
+    result["extra"]["verified_callable_targets"] = []
+    result["extra"]["rate_limited_targets"] = []
+
+    if response.status_code == 200:
+        result["status"] = "valid"
+        result["tier"] = "Unknown"
+        result["extra"]["credential_status"] = "valid"
+        result["extra"]["invocation_verification"] = "success"
+        result["extra"]["verified_callable_targets"] = [target_label]
+        return result
+    if response.status_code == 429:
+        result["status"] = "no_quota"
+        result["tier"] = "Unknown"
+        result["error"] = "deployment authenticated but rate limited"
+        result["extra"]["credential_status"] = "valid"
+        result["extra"]["invocation_verification"] = "rate_limited"
+        result["extra"]["rate_limited_targets"] = [target_label]
+        return result
+    if response.status_code == 401:
+        result["status"] = "invalid"
+        result["error"] = "invalid/revoked"
+        result["extra"]["invocation_verification"] = "authentication_failed"
+        return result
+
+    result["extra"]["http_status"] = response.status_code
+    result["extra"]["invocation_verification"] = "not_verified"
+    result["error"] = _error_message(response, api_key)
+    return result
 
 
 async def _request_models(
@@ -243,9 +357,13 @@ async def _validate_with_client(client: httpx.AsyncClient, credential: str) -> d
         return result
 
     endpoint, api_key = parsed
+    chat_url = azure_openai_chat_completions_url(endpoint)
+    if chat_url is not None and endpoint.startswith("https://"):
+        return await _validate_deployment_url(client, chat_url, api_key)
+
     result["extra"] = {
         "endpoint": endpoint,
-        "chat_completions_url": azure_openai_chat_completions_url(endpoint),
+        "chat_completions_url": chat_url,
         "validation_method": "models_list+minimal_chat_completion",
     }
 
@@ -323,7 +441,7 @@ async def _validate_with_client(client: httpx.AsyncClient, credential: str) -> d
 
 
 async def check(key: str, proxy: str | None = None) -> dict:
-    """Validate one Azure OpenAI ``endpoint|resource-key`` credential."""
+    """Validate one Azure OpenAI endpoint/deployment URL and resource key."""
     client_kwargs: dict[str, Any] = {
         "timeout": httpx.Timeout(45.0, connect=10.0),
         "follow_redirects": False,

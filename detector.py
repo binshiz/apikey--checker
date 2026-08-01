@@ -2,7 +2,7 @@
 import json
 import re
 import unicodedata
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 OPENAI_PATTERNS = [
     re.compile(r"^sk-proj-[A-Za-z0-9_\-]{40,}$"),
@@ -21,7 +21,20 @@ GEMINI_PATTERNS = [
 ]
 AZURE_OPENAI_ENDPOINT_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\."
-    r"(?:openai\.azure\.com|services\.ai\.azure\.com)$",
+    r"(?:openai\.azure\.com|services\.ai\.azure\.com|services\.azure\.com)$",
+    re.IGNORECASE,
+)
+AZURE_OPENAI_DEPLOYMENT_HOST_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cognitiveservices\.azure\.com$",
+    re.IGNORECASE,
+)
+AZURE_OPENAI_DEPLOYMENT_PATH_PATTERN = re.compile(
+    r"^/openai/deployments/"
+    r"(?P<deployment>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+    r"/chat/completions/?$",
+)
+AZURE_OPENAI_API_VERSION_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(?:-preview)?$",
     re.IGNORECASE,
 )
 AZURE_OPENAI_ALLOWED_PATHS = {
@@ -60,7 +73,7 @@ GCP_REQUIRED_STRING_FIELDS = (
 
 
 def _normalize_azure_openai_endpoint(value: str) -> str | None:
-    """Return a safe Azure OpenAI hostname from a base or inference URL."""
+    """Return a safe canonical Azure OpenAI host or deployment URL."""
     endpoint = unicodedata.normalize("NFKC", value).strip()
     if not endpoint:
         return None
@@ -75,15 +88,41 @@ def _normalize_azure_openai_endpoint(value: str) -> str | None:
         return None
     if parsed.username or parsed.password or has_port:
         return None
-    if parsed.query or parsed.fragment:
+    if parsed.fragment:
         return None
     hostname = (parsed.hostname or "").lower()
-    if not AZURE_OPENAI_ENDPOINT_PATTERN.fullmatch(hostname):
+
+    if AZURE_OPENAI_ENDPOINT_PATTERN.fullmatch(hostname):
+        if parsed.query:
+            return None
+        path = parsed.path.rstrip("/")
+        if path not in AZURE_OPENAI_ALLOWED_PATHS:
+            return None
+        return hostname
+
+    if not AZURE_OPENAI_DEPLOYMENT_HOST_PATTERN.fullmatch(hostname):
         return None
-    path = parsed.path.rstrip("/")
-    if path not in AZURE_OPENAI_ALLOWED_PATHS:
+    path_match = AZURE_OPENAI_DEPLOYMENT_PATH_PATTERN.fullmatch(parsed.path)
+    if path_match is None:
         return None
-    return hostname
+    try:
+        query = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError:
+        return None
+    if len(query) != 1 or query[0][0].lower() != "api-version":
+        return None
+    api_version = query[0][1]
+    if not AZURE_OPENAI_API_VERSION_PATTERN.fullmatch(api_version):
+        return None
+    deployment = path_match.group("deployment")
+    return (
+        f"https://{hostname}/openai/deployments/{deployment}"
+        f"/chat/completions?api-version={api_version.lower()}"
+    )
 
 
 def _azure_openai_candidate_parts(key: str) -> tuple[str, str] | None:
@@ -244,7 +283,7 @@ def normalize_key(key: str) -> str:
 
 
 def parse_azure_openai_key(key: str) -> tuple[str, str] | None:
-    """Parse Azure OpenAI ``[https://]resource-host|resource-key`` input."""
+    """Parse an Azure OpenAI resource host or deployment URL with its key."""
     parts = _azure_openai_candidate_parts(key)
     if parts is None:
         return None
@@ -263,11 +302,13 @@ def parse_openrouter_key(key: str) -> str | None:
 
 
 def azure_openai_chat_completions_url(endpoint: str) -> str | None:
-    """Build the canonical v1 Chat Completions URL for a safe endpoint."""
-    hostname = _normalize_azure_openai_endpoint(endpoint)
-    if hostname is None:
+    """Build or preserve the canonical Chat Completions URL."""
+    normalized = _normalize_azure_openai_endpoint(endpoint)
+    if normalized is None:
         return None
-    return f"https://{hostname}/openai/v1/chat/completions"
+    if normalized.startswith("https://"):
+        return normalized
+    return f"https://{normalized}/openai/v1/chat/completions"
 
 
 def parse_bedrock_api_key(key: str) -> str | None:

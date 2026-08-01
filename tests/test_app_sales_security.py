@@ -296,7 +296,7 @@ class AppSalesSecurityTests(unittest.TestCase):
         self.assertEqual(bundle.status_code, 200, bundle.text)
         self.assertEqual(
             bundle.text,
-            "\n\n".join([
+            "\n".join([
                 "\n".join([
                     f"{api_key}|us-east-1",
                     f"{api_key}|us-west-2",
@@ -337,6 +337,105 @@ class AppSalesSecurityTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_bedrock_bundle_places_flat_json_after_each_compatible_route_group(self):
+        api_key = "AKIA0000000000000000|" + "A" * 40
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        mappings_by_region = {
+            "af-south-1": {
+                "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
+            },
+            "ap-northeast-1": {
+                "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
+            },
+            "ca-west-1": {
+                "claude-opus-4-6": "eu.anthropic.claude-opus-4-6-v1",
+            },
+            "eu-west-1": {
+                "claude-opus-4-6": "eu.anthropic.claude-opus-4-6-v1",
+            },
+            "ca-central-1": {
+                "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
+            },
+            "us-west-1": {
+                "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
+            },
+            "ap-southeast-2": {
+                "claude-opus-4-5-20251101":
+                    "global.anthropic.claude-opus-4-5-20251101-v1:0",
+                "claude-opus-4-6": "au.anthropic.claude-opus-4-6-v1",
+            },
+            "ap-southeast-4": {
+                "claude-opus-4-5-20251101":
+                    "global.anthropic.claude-opus-4-5-20251101-v1:0",
+                "claude-opus-4-6": "au.anthropic.claude-opus-4-6-v1",
+            },
+        }
+        db.save_result(
+            key_id,
+            {
+                "status": "valid",
+                "tier": None,
+                "rpm": None,
+                "tpm": None,
+                "error": None,
+                "extra": {
+                    "invocation_verification": "success",
+                    "region_results": {
+                        region: {
+                            "invocations": [
+                                {
+                                    "model_id": target,
+                                    "status": "success",
+                                }
+                                for target in mapping.values()
+                            ],
+                        }
+                        for region, mapping in mappings_by_region.items()
+                    },
+                },
+            },
+        )
+
+        response = self.client.post(
+            "/api/keys/export",
+            headers=self.headers,
+            json={"ids": [key_id], "format": "bundle"},
+        )
+
+        global_mapping = {
+            "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
+        }
+        eu_mapping = {
+            "claude-opus-4-6": "eu.anthropic.claude-opus-4-6-v1",
+        }
+        us_mapping = {
+            "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
+        }
+        au_mapping = {
+            "claude-opus-4-5-20251101":
+                "global.anthropic.claude-opus-4-5-20251101-v1:0",
+            "claude-opus-4-6": "au.anthropic.claude-opus-4-6-v1",
+        }
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.text,
+            "\n".join([
+                f"{api_key}|af-south-1",
+                f"{api_key}|ap-northeast-1",
+                json.dumps(global_mapping, indent=2),
+                f"{api_key}|ca-west-1",
+                f"{api_key}|eu-west-1",
+                json.dumps(eu_mapping, indent=2),
+                f"{api_key}|ca-central-1",
+                f"{api_key}|us-west-1",
+                json.dumps(us_mapping, indent=2),
+                f"{api_key}|ap-southeast-2",
+                f"{api_key}|ap-southeast-4",
+                json.dumps(au_mapping, indent=2),
+            ]),
+        )
+        self.assertNotIn('"route_groups"', response.text)
 
     def test_native_bedrock_api_key_export_expands_authorized_regions(self):
         api_key = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "A" * 80 + "="

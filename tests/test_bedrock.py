@@ -414,8 +414,16 @@ class BedrockCheckerTests(unittest.TestCase):
             "ap-northeast-1": {
                 "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
             },
+            "ap-southeast-2": {
+                "claude-opus-4-5":
+                    "global.anthropic.claude-opus-4-5-v1:0",
+                "claude-opus-4-6": "au.anthropic.claude-opus-4-6-v1",
+            },
             "eu-west-1": {
                 "claude-opus-4-6": "eu.anthropic.claude-opus-4-6-v1",
+            },
+            "us-west-1": {
+                "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
             },
         }
 
@@ -423,7 +431,12 @@ class BedrockCheckerTests(unittest.TestCase):
             bedrock.build_gateway_region_groups(by_region),
             [{
                 "kind": "other_models",
-                "regions": ["ap-northeast-1", "eu-west-1"],
+                "regions": [
+                    "ap-northeast-1",
+                    "ap-southeast-2",
+                    "eu-west-1",
+                    "us-west-1",
+                ],
                 "mapping": {},
                 "route_groups": [
                     {
@@ -438,6 +451,22 @@ class BedrockCheckerTests(unittest.TestCase):
                         "mapping": {
                             "claude-opus-4-6":
                                 "eu.anthropic.claude-opus-4-6-v1",
+                        },
+                    },
+                    {
+                        "regions": ["us-west-1"],
+                        "mapping": {
+                            "claude-opus-4-6":
+                                "us.anthropic.claude-opus-4-6-v1",
+                        },
+                    },
+                    {
+                        "regions": ["ap-southeast-2"],
+                        "mapping": {
+                            "claude-opus-4-5":
+                                "global.anthropic.claude-opus-4-5-v1:0",
+                            "claude-opus-4-6":
+                                "au.anthropic.claude-opus-4-6-v1",
                         },
                     },
                 ],
