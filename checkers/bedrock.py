@@ -16,6 +16,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -108,6 +109,8 @@ _INVALID_CREDENTIAL_CODES = {
     "expiredtoken",
     "expiredtokenexception",
     "invalidaccesskeyid",
+    "invalidapikey",
+    "invalidbearertoken",
     "invalidclienttokenid",
     "invalidsignatureexception",
     "signaturedoesnotmatch",
@@ -1564,82 +1567,440 @@ def _is_invalid_bearer_response(status_code: int, error_code: str) -> bool:
     }
 
 
+def _bearer_headers(api_key: str, *, content_type: bool = False) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    if content_type:
+        headers.update({
+            "Content-Type": "application/json",
+            "X-Amzn-Bedrock-Accept": "application/json",
+        })
+    return headers
+
+
+def _target_profiles_from_payload(
+    payload: Any,
+    sensitive_values: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    profiles: list[dict[str, str]] = []
+    seen: set[str] = set()
+    summaries = payload.get("inferenceProfileSummaries", []) if isinstance(payload, dict) else []
+    for summary in summaries if isinstance(summaries, list) else []:
+        if not isinstance(summary, dict):
+            continue
+        model_id = _redact(
+            summary.get("inferenceProfileId") or "",
+            sensitive_values,
+        ).strip()[:256]
+        name = _redact(
+            summary.get("inferenceProfileName") or "",
+            sensitive_values,
+        ).strip()[:256]
+        family = _model_family(f"{model_id} {name}")
+        if not model_id or not family or model_id in seen:
+            continue
+        seen.add(model_id)
+        profiles.append({
+            "model_id": model_id,
+            "family": family,
+            "version": _model_version(f"{model_id} {name}") or "unknown",
+        })
+    return sorted(profiles, key=_profile_sort_key, reverse=True)
+
+
+def _target_foundation_models_from_payload(
+    payload: Any,
+    sensitive_values: tuple[str, ...] = (),
+) -> tuple[list[dict[str, str]], list[str]]:
+    models: list[dict[str, str]] = []
+    catalog_model_ids: list[str] = []
+    seen_models: set[str] = set()
+    summaries = payload.get("modelSummaries", []) if isinstance(payload, dict) else []
+    for summary in summaries if isinstance(summaries, list) else []:
+        if not isinstance(summary, dict):
+            continue
+        model_id = _redact(
+            summary.get("modelId") or "",
+            sensitive_values,
+        ).strip()[:256]
+        if not model_id or model_id in seen_models:
+            continue
+        seen_models.add(model_id)
+        catalog_model_ids.append(model_id)
+        name = _redact(
+            summary.get("modelName") or "",
+            sensitive_values,
+        ).strip()[:256]
+        provider = _redact(
+            summary.get("providerName") or "",
+            sensitive_values,
+        ).strip()[:128]
+        family = _model_family(f"{model_id} {name}")
+        if not family:
+            continue
+        models.append({
+            "model_id": model_id,
+            "name": name,
+            "provider": provider,
+            "family": family,
+            "version": _model_version(f"{model_id} {name}") or "unknown",
+        })
+    return (
+        sorted(models, key=_profile_sort_key, reverse=True),
+        sorted(catalog_model_ids),
+    )
+
+
+async def _list_bearer_target_profiles(
+    client: httpx.AsyncClient,
+    api_key: str,
+    region: str,
+) -> tuple[list[dict[str, str]], str | None, int | None]:
+    profiles: list[dict[str, str]] = []
+    seen_profiles: set[str] = set()
+    seen_tokens: set[str] = set()
+    next_token: str | None = None
+    last_status: int | None = None
+    while True:
+        params = {"maxResults": "1000", "type": "SYSTEM_DEFINED"}
+        if next_token:
+            params["nextToken"] = next_token
+        try:
+            response = await client.get(
+                f"https://bedrock.{region}.amazonaws.com/inference-profiles",
+                params=params,
+                headers=_bearer_headers(api_key),
+            )
+        except httpx.HTTPError as exc:
+            return profiles, type(exc).__name__, last_status
+        except Exception as exc:  # defensive: persist only the exception class
+            return profiles, type(exc).__name__, last_status
+        last_status = response.status_code
+        if response.status_code != 200:
+            return profiles, _bearer_error_code(response), response.status_code
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return profiles, "InvalidJSON", response.status_code
+        for profile in _target_profiles_from_payload(payload, (api_key,)):
+            if profile["model_id"] in seen_profiles:
+                continue
+            seen_profiles.add(profile["model_id"])
+            profiles.append(profile)
+        token_value = payload.get("nextToken") if isinstance(payload, dict) else None
+        next_token = str(token_value).strip()[:2048] if token_value else None
+        if not next_token:
+            break
+        if next_token in seen_tokens:
+            return profiles, "RepeatedPaginationToken", response.status_code
+        seen_tokens.add(next_token)
+    return sorted(profiles, key=_profile_sort_key, reverse=True), None, last_status
+
+
+async def _list_bearer_target_foundation_models(
+    client: httpx.AsyncClient,
+    api_key: str,
+    region: str,
+) -> tuple[list[dict[str, str]], list[str], str | None, int | None]:
+    try:
+        response = await client.get(
+            f"https://bedrock.{region}.amazonaws.com/foundation-models",
+            headers=_bearer_headers(api_key),
+        )
+    except httpx.HTTPError as exc:
+        return [], [], type(exc).__name__, None
+    except Exception as exc:  # defensive: persist only the exception class
+        return [], [], type(exc).__name__, None
+    if response.status_code != 200:
+        return [], [], _bearer_error_code(response), response.status_code
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return [], [], "InvalidJSON", response.status_code
+    models, catalog_model_ids = _target_foundation_models_from_payload(
+        payload,
+        (api_key,),
+    )
+    return models, catalog_model_ids, None, response.status_code
+
+
+def _bearer_response_reason(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    message = str(payload.get("message") or payload.get("Message") or "").lower()
+    if "operation not allowed" in message:
+        return "operation_not_allowed"
+    if "provider_data_share" in message or "data retention" in message:
+        return "data_retention_required"
+    return None
+
+
+async def _invoke_bearer_profile(
+    client: httpx.AsyncClient,
+    api_key: str,
+    region: str,
+    profile: dict[str, str],
+) -> dict:
+    family = profile.get("family") or _model_family(profile["model_id"]) or "unknown"
+    entry = {
+        "model_id": profile["model_id"],
+        "family": family,
+        "version": profile["version"],
+    }
+    try:
+        response = await client.post(
+            f"https://bedrock-runtime.{region}.amazonaws.com/model/"
+            f"{quote(profile['model_id'], safe='')}/invoke",
+            headers=_bearer_headers(api_key, content_type=True),
+            content=json.dumps(
+                _FABLE_5_INVOKE_BODY if family == "fable" else _INVOKE_BODY,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+    except httpx.HTTPError as exc:
+        entry.update(status="error", error_code=type(exc).__name__)
+        return entry
+    except Exception as exc:  # defensive: persist only the exception class
+        entry.update(status="error", error_code=type(exc).__name__)
+        return entry
+    if 200 <= response.status_code < 300:
+        entry["status"] = "success"
+        return entry
+    code = _bearer_error_code(response)
+    entry["status"] = "throttled" if _is_throttled(code) else "error"
+    entry["error_code"] = code
+    reason = _bearer_response_reason(response)
+    if reason:
+        entry["error_reason"] = reason
+    return entry
+
+
+def _bearer_region_status(
+    profile_http_status: int | None,
+    foundation_http_status: int | None,
+    profile_error: str | None,
+    foundation_error: str | None,
+) -> str:
+    statuses = [profile_http_status, foundation_http_status]
+    errors = [error for error in (profile_error, foundation_error) if error]
+    if 200 in statuses:
+        return "authorized"
+    if errors and all(
+        _is_invalid_bearer_response(status or 0, error)
+        for status, error in zip(statuses, (profile_error, foundation_error))
+        if error
+    ):
+        return "invalid"
+    if any(status == 403 for status in statuses):
+        return "denied"
+    if any(status == 429 for status in statuses) or any(_is_throttled(error) for error in errors):
+        return "throttled"
+    return "error"
+
+
+async def _scan_bearer_region(
+    client: httpx.AsyncClient,
+    api_key: str,
+    region: str,
+    *,
+    deep: bool,
+) -> tuple[dict, list[str], list[dict[str, str]]]:
+    result = _empty_region_result(region)
+    failures: list[dict[str, str]] = []
+
+    profiles, profile_error, profile_http_status = await _list_bearer_target_profiles(
+        client,
+        api_key,
+        region,
+    )
+    result["profiles"] = profiles
+    result["list_status"] = (
+        "partial" if profile_error and profiles
+        else "error" if profile_error
+        else "success"
+    )
+    if profile_error:
+        result["error_code"] = profile_error
+        failures.append(_failure(region, "profile_discovery", profile_error))
+
+    if _is_transport_error(profile_error):
+        foundation_models, catalog_models = [], []
+        foundation_error, foundation_http_status = profile_error, None
+    else:
+        (
+            foundation_models,
+            catalog_models,
+            foundation_error,
+            foundation_http_status,
+        ) = await _list_bearer_target_foundation_models(client, api_key, region)
+    result["foundation_models"] = foundation_models
+    result["foundation_model_list_status"] = (
+        "partial" if foundation_error and foundation_models
+        else "error" if foundation_error
+        else "success"
+    )
+    if foundation_error:
+        result["foundation_model_error_code"] = foundation_error
+        failures.append(_failure(region, "foundation_model_discovery", foundation_error))
+
+    control_status = _bearer_region_status(
+        profile_http_status,
+        foundation_http_status,
+        profile_error,
+        foundation_error,
+    )
+    result["status"] = control_status
+    result["http_status"] = foundation_http_status or profile_http_status
+    result["model_count"] = len(catalog_models)
+
+    discovery_denied = _is_access_denied(profile_error) and _is_access_denied(foundation_error)
+    known_fable = (
+        _known_fable_candidates(region)
+        if discovery_denied
+        and not any(
+            _model_key(model) == "fable:5"
+            for model in profiles + foundation_models
+        )
+        else []
+    )
+    candidates = _representative_models(profiles + known_fable, foundation_models)
+    if not candidates:
+        if not profile_error and not foundation_error:
+            failures.append(_failure(region, "model_discovery", "NoTargetClaudeModels"))
+        return result, catalog_models, failures
+
+    confirmed_families: set[str] = set()
+    attempt_counts = {"fable": 0, "opus": 0}
+    for profile in candidates:
+        family = profile.get("family") or _model_family(profile["model_id"]) or "unknown"
+        if deep:
+            if family == "fable" and family in confirmed_families:
+                continue
+        else:
+            limit = (
+                MAX_QUICK_FABLE_ATTEMPTS_PER_REGION
+                if family == "fable"
+                else MAX_QUICK_MODEL_ATTEMPTS_PER_REGION
+            )
+            if attempt_counts.get(family, 0) >= limit:
+                continue
+            attempt_counts[family] = attempt_counts.get(family, 0) + 1
+        invocation = await _invoke_bearer_profile(
+            client,
+            api_key,
+            region,
+            profile,
+        )
+        result["invocations"].append(invocation)
+        if family == "fable" and invocation["status"] in {"success", "throttled"}:
+            confirmed_families.add(family)
+        if invocation["status"] != "success":
+            code = invocation.get("error_code", "UnknownError")
+            failures.append(_failure(region, "invoke_model", code))
+            if not deep and (
+                invocation["status"] == "throttled"
+                or _is_invalid_credential(code)
+                or _is_transport_error(code)
+            ):
+                break
+        elif not deep:
+            break
+    return result, catalog_models, failures
+
+
 async def _check_bearer_api_key(
     api_key: str,
     proxy: str | None,
     mode: str,
     progress_callback=None,
 ) -> dict:
-    """Authenticate a native Bedrock API key against every supported region.
-
-    ``ListFoundationModels`` is read-only and does not generate model output or
-    inference charges. A 200 response proves both bearer authentication and
-    regional Bedrock control-plane access; it does not claim that every model
-    in the returned catalog is callable.
-    """
+    """Discover and runtime-probe Claude routes with a native Bedrock API key."""
     result = _base_result(mode, proxy)
     extra = result["extra"]
     extra.update({
         "credential_type": "bedrock_api_key",
         "authentication_scheme": "bearer",
-        "availability_basis": "list_foundation_models",
-        "invocation_verification": "not_attempted",
+        "availability_basis": "model_discovery_and_invoke_model",
+        "invocation_verification": "pending",
     })
     regions = configured_api_key_regions()
-    semaphore = asyncio.Semaphore(MAX_API_KEY_REGION_CONCURRENCY)
+    semaphore = asyncio.Semaphore(
+        MAX_DEEP_REGION_CONCURRENCY
+        if mode == "bedrock_deep"
+        else MAX_API_KEY_REGION_CONCURRENCY
+    )
+    remaining_tasks: list[asyncio.Task] = []
 
     async def scan(client: httpx.AsyncClient, region: str):
-        entry: dict[str, Any] = {"region": region, "status": "error"}
-        model_ids: list[str] = []
-        try:
-            response = await client.get(
-                f"https://bedrock.{region}.amazonaws.com/foundation-models",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Accept": "application/json",
-                },
-            )
-            entry["http_status"] = response.status_code
-            if response.status_code == 200:
-                entry["status"] = "authorized"
-                try:
-                    payload = response.json()
-                except (TypeError, ValueError):
-                    payload = {}
-                    entry["response_warning"] = "InvalidJSON"
-                summaries = payload.get("modelSummaries", []) if isinstance(payload, dict) else []
-                if isinstance(summaries, list):
-                    for summary in summaries:
-                        if not isinstance(summary, dict):
-                            continue
-                        model_id = str(summary.get("modelId") or "").strip()[:256]
-                        if model_id and model_id not in model_ids:
-                            model_ids.append(model_id)
-                entry["model_count"] = len(model_ids)
-            else:
-                error_code = _bearer_error_code(response)
-                entry["error_code"] = error_code
-                if _is_invalid_bearer_response(response.status_code, error_code):
-                    entry["status"] = "invalid"
-                elif response.status_code == 403:
-                    entry["status"] = "denied"
-                elif response.status_code == 429:
-                    entry["status"] = "throttled"
-        except httpx.HTTPError as exc:
-            entry["error_code"] = type(exc).__name__
-        except Exception as exc:  # defensive: never persist exception messages
-            entry["error_code"] = type(exc).__name__
-        finally:
-            await _notify_progress(progress_callback, region)
-        return region, entry, model_ids
+        async with semaphore:
+            try:
+                return region, await _scan_bearer_region(
+                    client,
+                    api_key,
+                    region,
+                    deep=mode == "bedrock_deep",
+                )
+            except Exception as exc:  # contain every regional failure
+                code = type(exc).__name__
+                region_result = _empty_region_result(region)
+                region_result.update(
+                    status="error",
+                    list_status="error",
+                    foundation_model_list_status="error",
+                    error_code=code,
+                )
+                return region, (
+                    region_result,
+                    [],
+                    [_failure(region, "region_scan", code)],
+                )
+            finally:
+                await _notify_progress(progress_callback, region)
+
+    outputs: list[tuple[str, tuple[dict, list[str], list[dict[str, str]]]]] = []
+
+    def has_runtime_proof(output) -> bool:
+        _, (region_result, _, _) = output
+        return any(
+            invocation.get("status") in {"success", "throttled"}
+            for invocation in region_result.get("invocations", [])
+        )
 
     try:
         async with _new_bearer_client(proxy) as client:
-            async def bounded_scan(region: str):
-                async with semaphore:
-                    return await scan(client, region)
-
-            outputs = await asyncio.gather(*(bounded_scan(region) for region in regions))
+            if mode == "bedrock_deep":
+                outputs = list(await asyncio.gather(*(scan(client, region) for region in regions)))
+            else:
+                try:
+                    async with asyncio.timeout(QUICK_GLOBAL_TIMEOUT_SECONDS):
+                        first = await scan(client, regions[0])
+                        outputs.append(first)
+                        if not has_runtime_proof(first):
+                            remaining_tasks = [
+                                asyncio.create_task(scan(client, region))
+                                for region in regions[1:]
+                            ]
+                            for completed in asyncio.as_completed(remaining_tasks):
+                                output = await completed
+                                outputs.append(output)
+                                if has_runtime_proof(output):
+                                    break
+                except TimeoutError:
+                    extra["partial_failures"].append(
+                        _failure("all", "quick_deadline", "QuickCheckTimeout")
+                    )
+                finally:
+                    for task in remaining_tasks:
+                        if not task.done():
+                            task.cancel()
+                    if remaining_tasks:
+                        await asyncio.gather(*remaining_tasks, return_exceptions=True)
     except Exception as exc:
         result["error"] = f"Bedrock API key check failed ({type(exc).__name__})"
         extra["credential_status"] = "unverified"
@@ -1652,9 +2013,10 @@ async def _check_bearer_api_key(
     throttled_regions: list[str] = []
     error_regions: list[str] = []
     counts_by_region: dict[str, int] = {}
-    for region, entry, model_ids in outputs:
+    for region, (entry, model_ids, failures) in outputs:
         extra["regions_checked"].append(region)
         extra["region_results"][region] = entry
+        extra["partial_failures"].extend(failures)
         catalog_models.update(model_ids)
         status = entry["status"]
         if status == "authorized":
@@ -1666,13 +2028,11 @@ async def _check_bearer_api_key(
             invalid_regions.append(region)
         elif status == "throttled":
             throttled_regions.append(region)
-        else:
+        elif status == "error":
             error_regions.append(region)
-            extra["partial_failures"].append(
-                _failure(region, "list_foundation_models", entry.get("error_code", "UnknownError"))
-            )
 
-    summary = extra["model_summary"]
+    result = _finish_result(result)
+    summary = result["extra"]["model_summary"]
     summary.update({
         "authorized_regions": authorized_regions,
         "denied_regions": denied_regions,
@@ -1685,25 +2045,23 @@ async def _check_bearer_api_key(
         "catalog_model_counts_by_region": counts_by_region,
     })
 
-    if authorized_regions:
-        result["status"] = "valid"
-        result["error"] = None
+    successful_regions = summary.get("successful_regions", [])
+    throttled_runtime_regions = summary.get("throttled_regions", [])
+    if successful_regions:
         extra["credential_status"] = "bedrock_verified"
-    elif throttled_regions:
-        result["status"] = "no_quota"
-        result["error"] = "Bedrock API key authenticated but region checks were throttled"
+    elif throttled_runtime_regions:
         extra["credential_status"] = "throttled"
-    elif invalid_regions and not denied_regions and not error_regions:
+    elif invalid_regions and not authorized_regions and not denied_regions and not error_regions:
         result["status"] = "invalid"
         result["error"] = "invalid or expired AWS Bedrock API key"
         extra["credential_status"] = "invalid"
+    elif authorized_regions:
+        extra["credential_status"] = "bedrock_verified"
+    elif throttled_regions:
+        extra["credential_status"] = "throttled"
     elif denied_regions:
-        result["status"] = "error"
-        result["error"] = "AWS Bedrock API key was denied in every supported region"
         extra["credential_status"] = "access_denied"
     else:
-        result["status"] = "error"
-        result["error"] = "AWS Bedrock API key could not be verified"
         extra["credential_status"] = "unverified"
     return result
 

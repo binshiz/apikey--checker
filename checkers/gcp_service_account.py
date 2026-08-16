@@ -19,13 +19,31 @@ TOKEN_REQUEST_TIMEOUT_SECONDS = 20
 VERTEX_REQUEST_TIMEOUT_SECONDS = 12
 VERTEX_API_BASE = "https://aiplatform.googleapis.com/v1"
 VERTEX_LOCATION = "global"
-VERTEX_MODEL_IDS = (
+VERTEX_GEMINI_MODEL_IDS = (
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
     "gemini-2.5-pro",
+)
+# Backward-compatible alias for callers and persisted test fixtures that use the
+# original generic name. These models are all Google-published Gemini models.
+VERTEX_MODEL_IDS = VERTEX_GEMINI_MODEL_IDS
+VERTEX_CLAUDE_MODEL_IDS = (
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+    "claude-3-5-haiku",
 )
 VERTEX_PROBE_BODY = {
     "contents": [{
@@ -34,6 +52,10 @@ VERTEX_PROBE_BODY = {
     }],
     "generationConfig": {"maxOutputTokens": 8},
 }
+VERTEX_CLAUDE_COUNT_TOKENS_MESSAGES = [{
+    "role": "user",
+    "content": "permission check",
+}]
 
 
 class _BoundedGoogleAuthRequest(GoogleAuthRequest):
@@ -64,6 +86,14 @@ def _vertex_model_url(project_id: str, model_id: str) -> str:
     return (
         f"{VERTEX_API_BASE}/projects/{project}/locations/{VERTEX_LOCATION}"
         f"/publishers/google/models/{model}:generateContent"
+    )
+
+
+def _vertex_claude_count_tokens_url(project_id: str) -> str:
+    project = quote(project_id, safe="")
+    return (
+        f"{VERTEX_API_BASE}/projects/{project}/locations/{VERTEX_LOCATION}"
+        "/publishers/anthropic/models/count-tokens:rawPredict"
     )
 
 
@@ -133,6 +163,67 @@ def _probe_vertex_models(
     }
 
 
+def _probe_vertex_claude_models(
+    session: requests.Session,
+    access_token: str,
+    project_id: str,
+) -> dict:
+    """Check Claude model access through the no-charge count-tokens endpoint."""
+    results: list[dict[str, str | int]] = []
+    url = _vertex_claude_count_tokens_url(project_id)
+    for model_id in VERTEX_CLAUDE_MODEL_IDS:
+        try:
+            response = session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model_id,
+                    "messages": VERTEX_CLAUDE_COUNT_TOKENS_MESSAGES,
+                },
+                timeout=VERTEX_REQUEST_TIMEOUT_SECONDS,
+            )
+            try:
+                http_status = int(response.status_code)
+                results.append({
+                    "model": model_id,
+                    "status": (
+                        "permission_granted"
+                        if 200 <= http_status < 300
+                        else _vertex_probe_status(http_status)
+                    ),
+                    "http_status": http_status,
+                })
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        except (requests.RequestException, TimeoutError, OSError):
+            results.append({"model": model_id, "status": "network_error"})
+            break
+        except Exception:
+            results.append({"model": model_id, "status": "error"})
+
+    supported_models = [
+        item["model"]
+        for item in results
+        if item["status"] == "permission_granted"
+    ]
+    return {
+        "claude_probe_method": "countTokens",
+        "claude_model_probe_results": results,
+        "claude_models_checked": len(results),
+        "claude_supported_models": supported_models,
+        "claude_supported_model_count": len(supported_models),
+        "claude_permission_verification": (
+            "success" if supported_models else "none"
+        ),
+    }
+
+
 def _refresh_credentials(info: dict, proxy: str | None) -> tuple[str | None, dict]:
     """Refresh once, invoke target models, and return non-secret metadata only."""
     safe_info = dict(info)
@@ -154,6 +245,11 @@ def _refresh_credentials(info: dict, proxy: str | None) -> tuple[str | None, dic
             credentials.token,
             info["project_id"],
         )
+        model_probe.update(_probe_vertex_claude_models(
+            session,
+            credentials.token,
+            info["project_id"],
+        ))
         return _expiry_timestamp(credentials), model_probe
     finally:
         session.close()

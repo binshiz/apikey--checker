@@ -178,7 +178,7 @@ ABSKQmVkcm9ja0FQSUtleS0...
 AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           ></textarea>
           <p id="keys-input-help" class="muted form-hint">
-            支持普通 Key（包括 OpenRouter）、Azure 端点与 Key，以及单个完整 GCP Service Account JSON。OpenRouter 会通过额度接口读取账号总额度、已使用额度和剩余额度；普通 Key 还会分别对 Claude Opus 5 和 Claude Fable 5 发送一次最小付费调用，两者都失败时再用 openrouter/free 验证 Key。Management Key 不调用模型，只读取账号额度。Anthropic Key 也会最小调用 Claude Opus 5。GCP JSON 也可通过下方文件选择器批量导入。
+            支持普通 Key（包括 OpenRouter）、Azure 端点与 Key，以及单个完整 GCP Service Account JSON。OpenRouter 会通过额度接口读取账号总额度、已使用额度和剩余额度；普通 Key 还会分别对 Claude Opus 5 和 Claude Fable 5 发送一次最小付费调用，两者都失败时再用 openrouter/free 验证 Key。Management Key 不调用模型，只读取账号额度。Anthropic Key 也会最小调用 Claude Opus 5。AWS Bedrock ABSK API Key 与 AK|SK 都会发现并最小调用 Claude 模型，以生成经过实际调用验证的区域重定向。GCP JSON 也可通过下方文件选择器批量导入。
           </p>
 
           <div class="credential-file-import">
@@ -196,7 +196,7 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
             <span id="gcp-file-summary" class="file-summary hidden" role="status" aria-live="polite"></span>
           </div>
           <p id="gcp-file-help" class="muted form-hint">
-            最多 100 个文件，每个不超过 64 KiB。检测会先换取 OAuth Token，再对目标 Vertex AI Gemini 模型发送最小化真实生成请求，可能产生少量模型费用；不检测 Google Play、IAM 或其他 GCP API 权限。
+            最多 100 个文件，每个不超过 64 KiB。检测会先换取 OAuth Token，再对目标 Vertex AI Gemini 模型发送最小化真实生成请求，并通过免费的 countTokens 接口检测 Claude 模型权限；Gemini 检测可能产生少量模型费用。不检测 Google Play、IAM 或其他 GCP API 权限。
           </p>
           <p id="gcp-file-error" class="auth-error hidden" role="alert"></p>
 
@@ -511,6 +511,6 @@ AKIA1234567890ABCDEF|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260727-anthropic-quota-v1"></script>
+    <script src="/static/app.js?v=20260805-bedrock-bearer-runtime-v1"></script>
   </body>
 </html>

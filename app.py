@@ -753,8 +753,9 @@ _AWS_REGION_EXPORT_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
 def _bedrock_export_regions(row: dict) -> list[str]:
     """Read verified regions for the row's specific Bedrock credential type.
 
-    SigV4 exports list Fable 5 regions first, then regions where another Claude
-    model was successfully invoked.
+    Both SigV4 and bearer exports list Fable 5 regions first, then regions where
+    another Claude model was successfully invoked. Older bearer records that
+    predate runtime probing retain their read-only authorized-region fallback.
     """
     raw_extra = row.get("extra")
     extra = raw_extra if isinstance(raw_extra, dict) else _parse_json_field(raw_extra)
@@ -765,32 +766,31 @@ def _bedrock_export_regions(row: dict) -> list[str]:
     summary = summary if isinstance(summary, dict) else {}
     api_key = str(row.get("api_key") or "")
     is_bearer_api_key = parse_bedrock_api_key(api_key) is not None
-    if is_bearer_api_key:
+    _, by_region, _, _ = _bedrock_gateway_support(row)
+    groups = bedrock_checker.build_gateway_region_groups(by_region)
+    values = [
+        region
+        for group in groups
+        for region in group["regions"]
+    ]
+    if not values:
+        fable_summary = summary.get("fable_5")
+        fable_regions = (
+            fable_summary.get("successful_regions")
+            if isinstance(fable_summary, dict)
+            else None
+        )
+        values = (
+            fable_regions
+            if isinstance(fable_regions, list) and fable_regions
+            else summary.get("successful_regions")
+        )
+    if is_bearer_api_key and (not isinstance(values, list) or not values):
         values = summary.get("authorized_regions")
-    else:
-        _, by_region, _, _ = _bedrock_gateway_support(row)
-        groups = bedrock_checker.build_gateway_region_groups(by_region)
-        values = [
-            region
-            for group in groups
-            for region in group["regions"]
-        ]
-        if not values:
-            fable_summary = summary.get("fable_5")
-            fable_regions = (
-                fable_summary.get("successful_regions")
-                if isinstance(fable_summary, dict)
-                else None
-            )
-            values = (
-                fable_regions
-                if isinstance(fable_regions, list) and fable_regions
-                else summary.get("successful_regions")
-            )
 
     # Compatibility fallback for older persisted results that recorded
     # successful invocations but did not yet materialize the summary field.
-    if not is_bearer_api_key and (not isinstance(values, list) or not values):
+    if not isinstance(values, list) or not values:
         region_results = extra.get("region_results")
         if isinstance(region_results, dict):
             values = [
@@ -917,14 +917,17 @@ def _secret_export_bundle_block(row: dict) -> str:
     # capability group needs multiple AWS geography routes, emit each compatible
     # route as its own ``credential lines + flat JSON`` block. This keeps every
     # mapping directly associated with exactly the regions where it was proven.
-    if (
-        row.get("provider") == "aws_bedrock"
-        and parse_bedrock_api_key(str(row.get("api_key") or "")) is None
-        and parse_bedrock_key(str(row.get("api_key") or "")) is not None
-        and by_region
-    ):
-        credentials = parse_bedrock_key(str(row.get("api_key") or ""))
-        canonical_key = "|".join(credentials) if credentials else ""
+    if row.get("provider") == "aws_bedrock" and by_region:
+        raw_key = str(row.get("api_key") or "")
+        bearer_api_key = parse_bedrock_api_key(raw_key)
+        credentials = parse_bedrock_key(raw_key)
+        canonical_key = (
+            bearer_api_key
+            if bearer_api_key is not None
+            else "|".join(credentials) if credentials else ""
+        )
+        if not canonical_key:
+            return key_text
         groups = bedrock_checker.build_gateway_region_groups(by_region)
         blocks: list[str] = []
 
