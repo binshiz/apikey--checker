@@ -32,6 +32,7 @@ def service_account_info(**overrides):
 
 def successful_online_result(*models):
     supported = list(models or ("gemini-3.6-flash",))
+    claude_supported = ["claude-sonnet-5"]
     return (
         "2026-07-24T12:00:00Z",
         {
@@ -45,6 +46,16 @@ def successful_online_result(*models):
             "supported_models": supported,
             "supported_model_count": len(supported),
             "model_invocation_verification": "success",
+            "claude_probe_method": "countTokens",
+            "claude_model_probe_results": [{
+                "model": claude_supported[0],
+                "status": "permission_granted",
+                "http_status": 200,
+            }],
+            "claude_models_checked": 1,
+            "claude_supported_models": claude_supported,
+            "claude_supported_model_count": 1,
+            "claude_permission_verification": "success",
         },
     )
 
@@ -77,6 +88,14 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
             result["extra"]["model_invocation_verification"],
             "success",
         )
+        self.assertEqual(
+            result["extra"]["claude_supported_models"],
+            ["claude-sonnet-5"],
+        )
+        self.assertEqual(
+            result["extra"]["claude_permission_verification"],
+            "success",
+        )
         refresh.assert_called_once()
         self.assertEqual(
             refresh.call_args.args[1],
@@ -104,6 +123,16 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
                     "supported_models": [],
                     "supported_model_count": 0,
                     "model_invocation_verification": "none",
+                    "claude_probe_method": "countTokens",
+                    "claude_model_probe_results": [{
+                        "model": "claude-sonnet-5",
+                        "status": "permission_denied",
+                        "http_status": 403,
+                    }],
+                    "claude_models_checked": 1,
+                    "claude_supported_models": [],
+                    "claude_supported_model_count": 0,
+                    "claude_permission_verification": "none",
                 },
             ),
         ):
@@ -114,6 +143,11 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["extra"]["supported_models"], [])
         self.assertEqual(
             result["extra"]["model_invocation_verification"],
+            "none",
+        )
+        self.assertEqual(result["extra"]["claude_supported_models"], [])
+        self.assertEqual(
+            result["extra"]["claude_permission_verification"],
             "none",
         )
 
@@ -182,6 +216,13 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
             response.status_code = 200 if index == 0 else 403
             response.text = f"response must not persist {PRIVATE_KEY}"
             responses.append(response)
+        for index, _model_id in enumerate(
+            gcp_service_account.VERTEX_CLAUDE_MODEL_IDS
+        ):
+            response = MagicMock()
+            response.status_code = 200 if index == 0 else 403
+            response.text = f"response must not persist {PRIVATE_KEY}"
+            responses.append(response)
         session.post.side_effect = responses
         with (
             patch(
@@ -218,6 +259,14 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_probe["supported_models"], ["gemini-3.6-flash"])
         self.assertEqual(model_probe["model_invocation_verification"], "success")
         self.assertEqual(
+            model_probe["claude_supported_models"],
+            ["claude-sonnet-5"],
+        )
+        self.assertEqual(
+            model_probe["claude_permission_verification"],
+            "success",
+        )
+        self.assertEqual(
             len(model_probe["model_probe_results"]),
             len(gcp_service_account.VERTEX_MODEL_IDS),
         )
@@ -235,6 +284,35 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
                 call.kwargs["json"],
                 gcp_service_account.VERTEX_PROBE_BODY,
             )
+            self.assertEqual(
+                call.kwargs["timeout"],
+                gcp_service_account.VERTEX_REQUEST_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                call.kwargs["headers"]["Authorization"],
+                f"Bearer {credentials.token}",
+            )
+        claude_calls = session.post.call_args_list[
+            len(gcp_service_account.VERTEX_MODEL_IDS):
+        ]
+        self.assertEqual(
+            len(claude_calls),
+            len(gcp_service_account.VERTEX_CLAUDE_MODEL_IDS),
+        )
+        for model_id, call in zip(
+            gcp_service_account.VERTEX_CLAUDE_MODEL_IDS,
+            claude_calls,
+        ):
+            self.assertIn(
+                "/locations/global/publishers/anthropic/models/count-tokens:rawPredict",
+                call.args[0],
+            )
+            self.assertEqual(call.kwargs["json"], {
+                "model": model_id,
+                "messages": (
+                    gcp_service_account.VERTEX_CLAUDE_COUNT_TOKENS_MESSAGES
+                ),
+            })
             self.assertEqual(
                 call.kwargs["timeout"],
                 gcp_service_account.VERTEX_REQUEST_TIMEOUT_SECONDS,
@@ -298,6 +376,68 @@ class GCPServiceAccountCheckerTests(unittest.IsolatedAsyncioTestCase):
             }],
         )
         self.assertEqual(result["model_invocation_verification"], "none")
+        self.assertNotIn("secret-access-token", repr(result))
+
+    def test_claude_probe_classifies_permissions_without_response_body(self):
+        session = MagicMock()
+        statuses = [200, 429, 403, 404, 400, 503]
+        responses = []
+        for http_status in statuses:
+            response = MagicMock()
+            response.status_code = http_status
+            response.text = f"secret response {PRIVATE_KEY}"
+            responses.append(response)
+        session.post.side_effect = responses
+
+        with patch.object(
+            gcp_service_account,
+            "VERTEX_CLAUDE_MODEL_IDS",
+            gcp_service_account.VERTEX_CLAUDE_MODEL_IDS[:len(statuses)],
+        ):
+            result = gcp_service_account._probe_vertex_claude_models(
+                session,
+                "secret-access-token",
+                "fixture-project",
+            )
+
+        self.assertEqual(
+            [probe["status"] for probe in result["claude_model_probe_results"]],
+            [
+                "permission_granted",
+                "rate_limited",
+                "permission_denied",
+                "not_found",
+                "request_rejected",
+                "upstream_error",
+            ],
+        )
+        self.assertEqual(
+            result["claude_supported_models"],
+            [gcp_service_account.VERTEX_CLAUDE_MODEL_IDS[0]],
+        )
+        self.assertEqual(result["claude_permission_verification"], "success")
+        self.assertNotIn("secret-access-token", repr(result))
+        self.assertNotIn(PRIVATE_KEY, repr(result))
+
+    def test_claude_probe_stops_after_transport_failure(self):
+        session = MagicMock()
+        session.post.side_effect = requests.Timeout("contains secret-access-token")
+
+        result = gcp_service_account._probe_vertex_claude_models(
+            session,
+            "secret-access-token",
+            "fixture-project",
+        )
+
+        self.assertEqual(session.post.call_count, 1)
+        self.assertEqual(
+            result["claude_model_probe_results"],
+            [{
+                "model": gcp_service_account.VERTEX_CLAUDE_MODEL_IDS[0],
+                "status": "network_error",
+            }],
+        )
+        self.assertEqual(result["claude_permission_verification"], "none")
         self.assertNotIn("secret-access-token", repr(result))
 
 

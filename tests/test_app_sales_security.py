@@ -477,6 +477,81 @@ class AppSalesSecurityTests(unittest.TestCase):
         )
         self.assertEqual(db.list_vault(), [])
 
+    def test_native_bedrock_api_key_exports_runtime_regions_and_grouped_mappings(self):
+        api_key = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "C" * 80 + "="
+        key_id = db.upsert_keys([api_key], {api_key: "aws_bedrock"})[0]
+        db.save_result(
+            key_id,
+            {
+                "status": "valid",
+                "tier": None,
+                "rpm": None,
+                "tpm": None,
+                "error": None,
+                "extra": {
+                    "credential_type": "bedrock_api_key",
+                    "invocation_verification": "success",
+                    "model_summary": {
+                        "authorized_regions": [
+                            "us-east-1",
+                            "eu-west-1",
+                            "ap-south-2",
+                        ],
+                        "successful_regions": ["us-east-1", "eu-west-1"],
+                    },
+                    "region_results": {
+                        "us-east-1": {
+                            "invocations": [{
+                                "model_id": "us.anthropic.claude-fable-5",
+                                "status": "success",
+                            }],
+                        },
+                        "eu-west-1": {
+                            "invocations": [{
+                                "model_id": "global.anthropic.claude-opus-4-8-v1:0",
+                                "status": "success",
+                            }],
+                        },
+                        "ap-south-2": {"invocations": []},
+                    },
+                },
+            },
+        )
+
+        txt_response = self.client.post(
+            "/api/keys/export",
+            headers=self.headers,
+            json={"ids": [key_id], "format": "txt"},
+        )
+        bundle_response = self.client.post(
+            "/api/keys/export",
+            headers=self.headers,
+            json={"ids": [key_id], "format": "bundle"},
+        )
+
+        self.assertEqual(txt_response.status_code, 200, txt_response.text)
+        self.assertEqual(
+            txt_response.text,
+            f"{api_key}|us-east-1\n{api_key}|eu-west-1",
+        )
+        self.assertEqual(bundle_response.status_code, 200, bundle_response.text)
+        self.assertEqual(
+            bundle_response.text,
+            "\n".join([
+                f"{api_key}|us-east-1",
+                json.dumps({
+                    "claude-fable-5": "us.anthropic.claude-fable-5",
+                }, indent=2),
+                f"{api_key}|eu-west-1",
+                json.dumps({
+                    "claude-opus-4-8":
+                        "global.anthropic.claude-opus-4-8-v1:0",
+                }, indent=2),
+            ]),
+        )
+        self.assertNotIn("ap-south-2", txt_response.text)
+        self.assertNotIn("ap-south-2", bundle_response.text)
+
     def test_native_bedrock_api_key_job_uses_bearer_region_count(self):
         api_key = "ABSK" + "QmVkcm9ja0FQSUtleS0" + "B" * 80 + "="
         with (

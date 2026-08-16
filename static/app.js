@@ -508,32 +508,43 @@ function targetModelChips(supported, excludedLabels = []) {
 }
 
 function gcpModelProbeChips(extra, compact = false) {
-	const results = Array.isArray(extra.model_probe_results)
+	const geminiResults = Array.isArray(extra.model_probe_results)
 		? extra.model_probe_results
 		: [];
-	const supported = Array.isArray(extra.supported_models)
+	const geminiSupported = Array.isArray(extra.supported_models)
 		? extra.supported_models
+		: [];
+	const claudeResults = Array.isArray(extra.claude_model_probe_results)
+		? extra.claude_model_probe_results
+		: [];
+	const claudeSupported = Array.isArray(extra.claude_supported_models)
+		? extra.claude_supported_models
 		: [];
 
 	if (compact) {
-		const visible = supported.slice(0, 3).map((model) => chip(model, "on model-chip", "Vertex AI generateContent 真实调用成功"));
-		if (supported.length > visible.length) {
-			visible.push(chip(`+${supported.length - visible.length}`, "model-more", supported.join("\n")));
+		const visible = geminiSupported.slice(0, 2).map((model) =>
+			chip(model, "on model-chip", "Vertex AI Gemini generateContent 真实调用成功")
+		);
+		visible.push(...claudeSupported.slice(0, 2).map((model) =>
+			chip(model, "on model-chip", "Vertex AI Claude countTokens 权限检测通过（非生成调用）")
+		));
+		const allSupported = [...geminiSupported, ...claudeSupported];
+		if (allSupported.length > visible.length) {
+			visible.push(chip(
+				`+${allSupported.length - visible.length}`,
+				"model-more",
+				`Gemini\n${geminiSupported.join("\n") || "—"}\n\nClaude\n${claudeSupported.join("\n") || "—"}`,
+			));
 		}
 		if (!visible.length && extra.token_exchange === "success") {
-			visible.push(chip("无模型调用证明", "warn", "OAuth 有效，但没有任何目标模型真实调用成功。"));
+			visible.push(chip("无模型权限证明", "warn", "OAuth 有效，但没有任何目标 Gemini 调用成功或 Claude 权限检测通过。"));
 		}
 		return visible;
 	}
 
-	if (!results.length) {
-		return extra.token_exchange === "success"
-			? [chip("模型需复检", "warn", "该记录尚未执行 Vertex AI generateContent 真实调用。")]
-			: [];
-	}
-
 	const labels = {
 		callable: ["可调用", "on"],
+		permission_granted: ["权限通过", "on"],
 		rate_limited: ["限流", "warn"],
 		permission_denied: ["无权限", "off"],
 		not_found: ["不可用", "off"],
@@ -544,15 +555,31 @@ function gcpModelProbeChips(extra, compact = false) {
 		http_error: ["HTTP 错误", "off"],
 		error: ["检测错误", "warn"],
 	};
-	return results.map((probe) => {
+	const probeChip = (probe, provider, method) => {
 		const [statusText, className] = labels[probe.status] || ["未确认", "warn"];
 		const http = probe.http_status ? `HTTP ${probe.http_status}` : "未收到 HTTP 响应";
 		return chip(
 			`${probe.model} · ${statusText}`,
 			`${className} model-chip`,
-			`Vertex AI ${extra.vertex_location || "global"} generateContent\n${http}`,
+			`Vertex AI ${extra.vertex_location || "global"} · ${provider} · ${method}\n${http}`,
 		);
-	});
+	};
+	const chips = [];
+	if (geminiResults.length) {
+		chips.push(...geminiResults.map((probe) =>
+			probeChip(probe, "Gemini", "generateContent 真实调用")
+		));
+	} else if (extra.token_exchange === "success") {
+		chips.push(chip("Gemini 需复检", "warn", "该记录尚未执行 Vertex AI Gemini 真实生成调用。"));
+	}
+	if (claudeResults.length) {
+		chips.push(...claudeResults.map((probe) =>
+			probeChip(probe, "Claude", "countTokens 权限检测（非生成调用）")
+		));
+	} else if (extra.token_exchange === "success") {
+		chips.push(chip("Claude 需复检", "warn", "该记录尚未执行 Vertex AI Claude countTokens 权限检测。"));
+	}
+	return chips;
 }
 
 function bedrockDetailChipList(extra, compact = false) {
@@ -561,11 +588,11 @@ function bedrockDetailChipList(extra, compact = false) {
 	const credentialType = extra.credential_type || "";
 	const isBearerApiKey = credentialType === "bedrock_api_key";
 	const isDeep = extra.check_mode === "bedrock_deep" || extra.check_mode === "deep";
-	const mode = isBearerApiKey
-		? "API Key 区域检测"
-		: isDeep
+	const mode = isDeep
 		? "全区域深检"
-		: "快速检测";
+		: isBearerApiKey
+			? "API Key 快速检测"
+			: "快速检测";
 	chips.push(chip(mode, isDeep ? "aws-deep" : ""));
 	if (isBearerApiKey) chips.push(chip("Bearer API Key", "aws-deep"));
 
@@ -645,9 +672,9 @@ function bedrockDetailChipList(extra, compact = false) {
 		: [];
 	if (isBearerApiKey && authorizedRegions.length) {
 		chips.push(chip(
-			`可用区域 ${authorizedRegions.length}`,
+			`目录授权区域 ${authorizedRegions.length}`,
 			"on",
-			`以下区域的只读模型列表接口认证成功；未执行模型调用：\n${authorizedRegions.join("\n")}`,
+			`以下区域的 Claude 模型目录接口认证成功；真实调用成功区域请以“首组”和“任意模型成功区域”为准：\n${authorizedRegions.join("\n")}`,
 		));
 	}
 	if (isBearerApiKey && deniedRegions.length && !compact) {
@@ -1279,9 +1306,9 @@ function detailChips(r) {
 		}
 		chips.push(...gcpModelProbeChips(e));
 		chips.push(chip(
-			"仅检测 Vertex 模型权限",
+			"Vertex Gemini + Claude",
 			"warn",
-			"模型支持仅在 generateContent 真实调用成功时显示；不代表拥有 Google Play、IAM 或其他 GCP API 权限。",
+			"Gemini 通过最小 generateContent 真实调用验证；Claude 通过无生成费用的 countTokens 验证模型权限。不代表拥有 Google Play、IAM 或其他 GCP API 权限。",
 		));
 	}
 	if (r.error) {
@@ -1604,10 +1631,10 @@ function confirmBedrockDeep(rows, skipped = 0, useProxy = false) {
 		? "本次检测将使用已勾选的 SOCKS5 代理池。"
 		: "本次检测将直连 AWS。";
 	const actionText = sigv4Count
-		? `其中 ${sigv4Count} 个 AWS Access Key 将扫描全部已知 Bedrock 区域，并最小调用 Claude Fable 5 与 Opus；真实调用可能产生费用。若账户已为 Fable 5 开启 provider_data_share，探测输入“.”及输出可能按 AWS 规则保留并共享。${bearerCount ? `\n另有 ${bearerCount} 个 ABSK API Key 仅调用只读模型列表，不产生推理费用。` : ""}`
-		: "ABSK API Key 将扫描 AWS 官方支持的全部区域，只调用只读模型列表，不调用模型，也不产生推理费用。";
+		? `其中 ${sigv4Count} 个 AWS Access Key 将扫描全部已知 Bedrock 区域。${bearerCount ? `\n另有 ${bearerCount} 个 ABSK API Key 将扫描 AWS 官方支持 API Key 的区域。` : ""}`
+		: "ABSK API Key 将扫描 AWS 官方支持 API Key 的全部区域。";
 	return confirm(
-		`确认深检 ${count} 个 AWS Bedrock Key？\n${actionText}\n${connectionText}${skippedText}`,
+		`确认深检 ${count} 个 AWS Bedrock Key？\n${actionText}\n两种凭证都会发现 Claude Fable 5 与 Opus，并发送最小 InvokeModel 请求来生成区域模型重定向；真实调用可能产生费用。若账户已为 Fable 5 开启 provider_data_share，探测输入“.”及输出可能按 AWS 规则保留并共享。\n${connectionText}${skippedText}`,
 	);
 }
 

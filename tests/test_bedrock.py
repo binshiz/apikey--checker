@@ -126,24 +126,47 @@ class BedrockCheckerTests(unittest.TestCase):
 
         return factory
 
-    def test_native_api_key_scans_supported_regions_without_invoking_models(self):
+    def test_native_api_key_deep_check_discovers_invokes_and_builds_mappings(self):
         progress = []
+        runtime_requests = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.headers["Authorization"], f"Bearer {BEDROCK_API_KEY}")
-            region = request.url.host.removeprefix("bedrock.").removesuffix(".amazonaws.com")
+            host = request.url.host
+            is_runtime = host.startswith("bedrock-runtime.")
+            region = host.removeprefix(
+                "bedrock-runtime." if is_runtime else "bedrock."
+            ).removesuffix(".amazonaws.com")
             if region == "ap-south-2":
                 return httpx.Response(
                     403,
                     headers={"x-amzn-errortype": "AccessDeniedException"},
                     json={"message": "denied"},
                 )
+            if is_runtime:
+                runtime_requests.append(request)
+                self.assertEqual(request.headers["Content-Type"], "application/json")
+                self.assertEqual(request.headers["X-Amzn-Bedrock-Accept"], "application/json")
+                return httpx.Response(200, json={"content": [{"text": SECRET_ACCESS_KEY}]})
+            if request.url.path == "/inference-profiles":
+                scope = "us" if region == "us-east-1" else "eu"
+                return httpx.Response(200, json={
+                    "inferenceProfileSummaries": [
+                        {"inferenceProfileId": f"{scope}.anthropic.claude-fable-5"},
+                        {"inferenceProfileId": "global.anthropic.claude-opus-4-8-v1:0"},
+                        {"inferenceProfileId": f"{scope}.anthropic.claude-sonnet-4-6"},
+                    ],
+                })
             return httpx.Response(
                 200,
                 json={
                     "modelSummaries": [
                         {"modelId": "amazon.nova-lite-v1:0"},
-                        {"modelId": f"anthropic.claude-{region}"},
+                        {
+                            "modelId": f"anthropic.claude-opus-4-8-{region}-v1:0",
+                            "modelName": "Claude Opus 4.8",
+                            "providerName": "Anthropic",
+                        },
                     ]
                 },
             )
@@ -159,7 +182,7 @@ class BedrockCheckerTests(unittest.TestCase):
             patch.object(bedrock, "_new_session", side_effect=AssertionError("SigV4 path used")),
         ):
             result = self.run_async(
-                bedrock.check(
+                bedrock.deep_check(
                     BEDROCK_API_KEY,
                     proxy="socks5://127.0.0.1:1080",
                     progress_callback=progress.append,
@@ -170,7 +193,7 @@ class BedrockCheckerTests(unittest.TestCase):
         self.assertEqual(result["status"], "valid")
         self.assertEqual(result["extra"]["credential_type"], "bedrock_api_key")
         self.assertEqual(result["extra"]["credential_status"], "bedrock_verified")
-        self.assertEqual(result["extra"]["invocation_verification"], "not_attempted")
+        self.assertEqual(result["extra"]["invocation_verification"], "success")
         self.assertEqual(
             result["extra"]["model_summary"]["authorized_regions"],
             ["us-east-1", "eu-west-1"],
@@ -180,8 +203,28 @@ class BedrockCheckerTests(unittest.TestCase):
             ["ap-south-2"],
         )
         self.assertEqual(result["extra"]["model_summary"]["catalog_model_count"], 3)
-        self.assertEqual(progress, ["us-east-1", "ap-south-2", "eu-west-1"])
-        self.assertNotIn(BEDROCK_API_KEY, json.dumps(result))
+        self.assertEqual(
+            result["extra"]["model_summary"]["successful_regions"],
+            ["eu-west-1", "us-east-1"],
+        )
+        self.assertEqual(
+            result["extra"]["gateway_mappings_by_region"],
+            {
+                "eu-west-1": {
+                    "claude-fable-5": "eu.anthropic.claude-fable-5",
+                    "claude-opus-4-8": "global.anthropic.claude-opus-4-8-v1:0",
+                },
+                "us-east-1": {
+                    "claude-fable-5": "us.anthropic.claude-fable-5",
+                    "claude-opus-4-8": "global.anthropic.claude-opus-4-8-v1:0",
+                },
+            },
+        )
+        self.assertEqual(len(runtime_requests), 4)
+        self.assertCountEqual(progress, ["us-east-1", "ap-south-2", "eu-west-1"])
+        serialized = json.dumps(result)
+        self.assertNotIn(BEDROCK_API_KEY, serialized)
+        self.assertNotIn(SECRET_ACCESS_KEY, serialized)
 
     def test_native_api_key_all_unauthorized_is_invalid(self):
         def handler(request: httpx.Request) -> httpx.Response:

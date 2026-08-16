@@ -47,7 +47,7 @@ class OpenRouterAppTests(unittest.TestCase):
             3,
         )
         self.assertEqual(response.text.count("<option>Paid</option>"), 3)
-        self.assertIn("/static/app.js?v=20260727-anthropic-quota-v1", response.text)
+        self.assertIn("/static/app.js?v=20260805-bedrock-bearer-runtime-v1", response.text)
         self.assertIn("/static/style.css?v=20260725-bedrock-groups", response.text)
 
     def test_import_detects_masks_and_exports_openrouter_key(self):
